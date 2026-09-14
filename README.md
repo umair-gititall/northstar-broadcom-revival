@@ -23,7 +23,7 @@ open-source driver. `b43`'s AC-PHY support is `depends on BROKEN` and
 | `nas` | WPA authenticator. The 4-way handshake ends in `WLC_SET_KEY`, the driver's own ioctl |
 | `wldiag` | Written for this port: asks the driver what it thinks its state is |
 | `wl` | FreshTomato's command-line tool, shipped **as their prebuilt uClibc binary** — they have no source for it. `rc` shells out to it for `antdiv`, `txant`, `txpwr1`, `interference`, `ldpc_cap`, `vhtmode` and `vht_features` |
-| `uclibc.so` | Not a libc: the one-function shim that lets that binary run against musl |
+| `uclibc.so` | Not a libc: the small shim that lets that binary run against musl — `__uClibc_main`, and a `__ctype_b_loc` whose class bits are uClibc's |
 
 `libbcmcrypto` is built as a static archive and linked into `nas`; it is not
 installed.
@@ -62,6 +62,34 @@ refuses to run if anything about that picture stops holding.
 `uclibc_compat.c` carries the disassembly of the binary's `_start` that pins
 down `__uClibc_main`'s argument list, and the reason it forwards to musl's own
 `__libc_start_main` instead of open-coding the startup.
+
+"Provides" is not the same as "agrees with", and one of those 64 does not:
+**`__ctype_b_loc`**. Both libcs hand back a table of per-byte class masks and
+the binary has the mask constants compiled into it, but uClibc numbers the
+classes `1 << bit` while musl reproduces glibc's `_ISbit`, which swaps the two
+halves — space is `0x20` for one and `0x2000` for the other. So `isspace()`,
+`isxdigit()` and `isprint()` were false for every byte, and `isdigit()` was
+really `isalnum()`. `wl_find()` — the interface search that runs when no `-i`
+is given — skips leading whitespace with `isspace()` before splitting a
+`/proc/net/dev` line, and the kernel prints those lines with `"%6s: "`, so the
+name it looked up kept its padding: `"   wl0"`, `ENODEV`, no interface ever
+matched, and `wl ver` answered `wl driver adapter not found` on a working
+driver. `uclibc.so` therefore also exports `__ctype_b_loc` with uClibc's
+layout; it is ahead of musl in the global symbol scope, and `find_sym2()`
+stops at the first match. Nothing else in the process reads that table — musl's
+own `is*()` are range tests, and it exports `__ctype_b_loc` only for
+glibc-ABI callers like this one.
+
+Only `wl -i <ifname>` was ever exercised before, which is why this went
+unseen: `rc` names the interface on every call and that branch skips
+`wl_find()` entirely.
+
+One more of the 64 disagrees the same way and is **not** bridged: `fstat`.
+The binary reads `st_size` at offset 44, uClibc's non-LFS `struct stat`
+position; musl's is the kernel `stat64` layout, where 44 is padding and
+`st_size` is at 48. Its one caller is the `dload`/CLM-from-file path, which
+therefore sees every file as empty. Nothing in Tomato64 uses it — the driver
+carries its own CLM — so it is recorded here rather than shimmed.
 
 ## How wl.ko works, briefly
 
