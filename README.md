@@ -232,6 +232,10 @@ radio's.
 
 This repo contains two kinds of material.
 
+The top-level `LICENSE` (MIT) covers this project's **own work**: the translation
+layer, the build system, the OpenWrt integration, and the documentation. The
+third-party material below keeps its own terms.
+
 **Source is committed.** The translation layer, the build system, the userspace
 tools, and the vendored Broadcom sources and headers (see `vendor/README.md`).
 Several of these files are Broadcom proprietary source, carrying their original
@@ -263,3 +267,27 @@ make -f Makefile.standalone userspace CROSS_COMPILE=<abs-path>-
 ```
 
 `CROSS_COMPILE` must be absolute — the kernel `cd`s during the build.
+
+## Credits
+
+This port stands on other people's work:
+
+- **[tomato64/broadcom-wl](https://github.com/tomato64/broadcom-wl)** — the
+  upstream project this repository is derived from. The translation-layer
+  approach (objcopy symbol interposition plus the struct-shadow layer) was
+  worked out there; this fork retargets it from Tomato64 to **stock OpenWrt** on
+  the Buffalo WZR-1750DHP and adds the netifd/LuCI glue and APK packaging.
+- **FreshTomato** ([tomato64/freshtomato-arm](https://github.com/tomato64/freshtomato-arm))
+  — the source of the `wl_apsta.o` driver object and the prebuilt `wl` tool,
+  and of the Broadcom sources and headers vendored under `vendor/`. FreshTomato
+  itself descends from **Tomato** (Jonathan Zarate and contributors).
+- **Broadcom** — `wl`, the `wl` control tool, and the shared/userspace libraries
+  are Broadcom's proprietary work. This repository only repackages and hosts
+  them on a newer kernel; it claims no rights to them.
+- **[firmadyne](https://github.com/firmadyne/libnvram)** — `vendor/libnvram/` is
+  firmadyne's NVRAM-emulation library.
+- **[OpenWrt](https://openwrt.org)** — the target platform, whose netifd
+  wireless framework the integration plugs into.
+- **Linux** — the kernel the 2.6.36-era blob is hosted on.
+
+Questions about attribution — or a takedown request — are welcome as an issue.
