@@ -1,0 +1,58 @@
+#!/bin/sh /etc/rc.common
+#
+# Load (or unload) the Broadcom `wl` blob driver on the WZR-1750DHP.
+#
+# The driver is not a bcma driver, so on this board it cannot simply
+# modprobe: the two radios (14e4:4331 2.4GHz, 14e4:43a0 5GHz) are claimed at
+# boot by b43 through the built-in bcma-pci-bridge driver. To hand them to wl
+# we unbind them from that driver and then load wl.ko, whose own pci_driver
+# id-table matches the same two IDs and probes them.
+#
+# bcma-pci-bridge is built into the kernel on this target (CONFIG_BCMA_HOST_PCI=y
+# links host_pci.o into the built-in bcma), so there is no module to rmmod; the
+# sysfs unbind is the only handle. See README.md for the wider architecture.
+
+START=19
+STOP=90
+
+WL_MODULE=/lib/modules/$(uname -r)/wl.ko
+BCMA_DRV=/sys/bus/pci/drivers/bcma-pci-bridge
+
+start() {
+	/usr/sbin/broadcom-wl-ctl seed
+
+	# b43 owns the radios until we take them.
+	rmmod b43 2>/dev/null
+
+	# Release both radios from the PCIe bridge driver.
+	for dev in "$BCMA_DRV"/0*; do
+		[ -e "$dev" ] || continue
+		echo "$(basename "$dev")" > "$BCMA_DRV/unbind" 2>/dev/null
+	done
+
+	if ! grep -q '^wl ' /proc/modules 2>/dev/null; then
+		# intf_name=wl%d names the primary netdevs wl0/wl1, which is what
+		# wlconf/nas/eapd expect on their command lines.
+		if ! insmod "$WL_MODULE" intf_name=wl%d; then
+			logger -t broadcom-wl "failed to load $WL_MODULE"
+			return 1
+		fi
+	fi
+
+	return 0
+}
+
+stop() {
+	/usr/sbin/broadcom-wl-ctl security-stop
+
+	rmmod wl 2>/dev/null
+
+	# Give the radios back to b43 (which re-binds through the bridge driver).
+	modprobe b43 2>/dev/null
+
+	return 0
+}
+
+boot() {
+	start
+}

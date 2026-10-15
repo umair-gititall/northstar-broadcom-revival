@@ -1,0 +1,15 @@
+#!/bin/sh
+#
+# CLI entry point for the broadcom-wl userspace glue. All logic lives in
+# /usr/lib/broadcom-wl/common.sh so the init script and the netifd handler can
+# source the same functions; this wrapper exists only so the ucode handler
+# (which cannot source shell) has something to exec.
+
+BCW_RUNDIR="${BCW_RUNDIR:-/var/run/broadcom-wl}"
+mkdir -p "$BCW_RUNDIR"
+
+# Common.sh runs bcw_main itself when executed directly; suppress that when we
+# are only sourcing its functions.
+BCW_NO_MAIN=1 . /usr/lib/broadcom-wl/common.sh
+
+bcw_main "$@"

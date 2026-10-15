@@ -1,0 +1,99 @@
+# broadcom-wl: standalone build of everything except the kernel module itself.
+#
+# This is the build used while developing outside OpenWrt (see STATE.md and
+# the manual commands in README.md). The OpenWrt package build lives in the
+# root Makefile; it reuses this file for the two steps that must happen before
+# the kernel-module compile:
+#
+#   1. objcopy the blob into wl_apsta.o_shipped, which kbuild's prebuilt-object
+#      rule (scripts/Makefile.lib: `$(obj)/%: $(src)/%_shipped`) then picks up;
+#   2. build the userspace tools, which have nothing to do with the module but
+#      share the vendored Broadcom headers.
+#
+# One "tool" is not a tool: uclibc-compat builds the uclibc.so shim that lets
+# FreshTomato's prebuilt `wl` (vendor/wl/arm-uclibc/wl, installed as-is) run
+# against musl. See userspace/uclibc-compat/README.md.
+#
+# Usage (standalone):
+#   make -f Makefile.standalone OBJCOPY=<cross-objcopy> wl_apsta.o_shipped
+#   make -f Makefile.standalone userspace CROSS_COMPILE=<abs-path>-
+# The kernel module itself is built with kbuild:
+#   make -C <linux> M=<here> ARCH=arm CROSS_COMPILE=<abs-path>- modules
+
+OBJCOPY ?= objcopy
+
+USERSPACE := libbcmcrypto wlconf wldiag eapd nas uclibc-compat
+
+.PHONY: all userspace clean $(USERSPACE)
+
+all: wl_apsta.o_shipped userspace
+
+# Interposition. --redefine-sym rewrites only the *blob's* references, so the
+# genuine kernel functions stay callable by the translation layer - which is
+# what makes the shadow layers possible without patching the kernel.
+#
+# init_module/cleanup_module are renamed so the shim owns module entry and can
+# set up state before the blob runs.
+#
+# __param is removed rather than translated: the blob ships a 2.6.36-laid-out
+# array of struct kernel_param, and 6.12 inserted `struct module *mod` at
+# offset 4, moving ->ops 4->8 and the stride 16->20. The loader walked it with
+# the current layout, read ->perm as ->ops, got NULL and oopsed in
+# module_destroy_params(). Dropping the section costs only the ability to set
+# the blob's eight tunables on the insmod line; their compiled-in defaults
+# still apply, and intf_name is re-exposed as one of our own module_params
+# (which is why it is globalized below - module_param_string() had made it
+# static).
+#
+# Depends on this Makefile: without that, editing this list leaves a stale
+# _shipped object carrying the old names and the reroute silently does nothing.
+wl_apsta.o_shipped: vendor/wl/linux/wl_apsta.o Makefile.standalone
+	$(OBJCOPY) \
+	  --redefine-sym init_module=wl_blob_init_module \
+	  --redefine-sym cleanup_module=wl_blob_cleanup_module \
+	  --redefine-sym init_timer_key=wl_shim_init_timer_key \
+	  --redefine-sym add_timer=wl_shim_add_timer \
+	  --redefine-sym del_timer=wl_shim_del_timer \
+	  --redefine-sym dev_alloc_skb=wl_shim_dev_alloc_skb \
+	  --redefine-sym skb_put=wl_shim_skb_put \
+	  --redefine-sym skb_push=wl_shim_skb_push \
+	  --redefine-sym skb_pull=wl_shim_skb_pull \
+	  --redefine-sym netif_rx=wl_shim_netif_rx \
+	  --redefine-sym eth_type_trans=wl_shim_eth_type_trans \
+	  --redefine-sym alloc_netdev_mq=wl_shim_alloc_netdev_mq \
+	  --redefine-sym register_netdev=wl_shim_register_netdev \
+	  --redefine-sym unregister_netdev=wl_shim_unregister_netdev \
+	  --redefine-sym free_netdev=wl_shim_free_netdev \
+	  --redefine-sym __netif_schedule=wl_shim___netif_schedule \
+	  --redefine-sym __pci_register_driver=wl_shim___pci_register_driver \
+	  --redefine-sym pci_unregister_driver=wl_shim_pci_unregister_driver \
+	  --redefine-sym pci_enable_device=wl_shim_pci_enable_device \
+	  --redefine-sym pci_disable_device=wl_shim_pci_disable_device \
+	  --redefine-sym pci_set_master=wl_shim_pci_set_master \
+	  --redefine-sym outer_cache=wl_shim_outer_cache \
+	  --redefine-sym remove_proc_entry=wl_shim_remove_proc_entry \
+	  --redefine-sym tasklet_init=wl_shim_tasklet_init \
+	  --redefine-sym __tasklet_schedule=wl_shim___tasklet_schedule \
+	  --redefine-sym tasklet_kill=wl_shim_tasklet_kill \
+	  --remove-section __param --remove-section .rel__param \
+	  --globalize-symbol intf_name \
+	  $< $@
+	@# The blob declares license=Proprietary, so modpost refuses it the
+	@# GPL-only skb_to_sgvec() that linux_osl.c needs (it was a plain
+	@# EXPORT_SYMBOL in 2.6.36, which is why FreshTomato never hit this).
+	@# The module still taints the kernel at load, which is correct and
+	@# left alone. Drop this line to revert - the module then goes back to
+	@# Proprietary, and back to failing to link.
+	python3 shadow/relicense-modinfo.py $(OBJCOPY) $@ GPL
+
+userspace: $(USERSPACE)
+
+# nas links libbcmcrypto.a, so it must be built first.
+nas: libbcmcrypto
+
+$(USERSPACE):
+	$(MAKE) -C userspace/$@
+
+clean:
+	rm -f wl_apsta.o_shipped
+	$(foreach d,$(USERSPACE),$(MAKE) -C userspace/$(d) clean;)

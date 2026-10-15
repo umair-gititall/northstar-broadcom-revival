@@ -1,0 +1,23 @@
+#!/bin/sh
+#
+# (Re)start the WPA daemons when a bridge that carries a wl radio comes up.
+#
+# The netifd handler already starts eapd/nas at setup time, but eapd binds its
+# packet socket to the *bridge* (get_ifname_by_wlmac() -> lan_ifname), and the
+# bridge may not have finished coming up at that point. This hook is the
+# second chance: it runs after the network interface is configured.
+
+BCW_NO_MAIN=1 . /usr/lib/broadcom-wl/common.sh
+
+[ -n "$(bcw_all_wl_ifaces)" ] || exit 0
+
+case "$ACTION" in
+ifup)
+	bcw_security_start "br-$INTERFACE"
+	;;
+ifdown)
+	bcw_security_stop
+	;;
+esac
+
+exit 0

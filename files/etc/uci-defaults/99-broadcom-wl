@@ -1,0 +1,49 @@
+#!/bin/sh
+#
+# Seed /etc/config/wireless for the broadcom `wl` driver, once, on first boot
+# after the package is installed.
+#
+# The stock WZR-1750DHP image ships a wireless config for the b43 driver
+# (option type 'mac80211'), which the wl driver does not use. We take the file
+# over, keeping a copy of what was there. If a broadcom device is already
+# present, an admin (or LuCI) has already configured it and we leave it alone.
+
+[ -f /etc/config/wireless ] && grep -q "type 'broadcom'" /etc/config/wireless && exit 0
+
+[ -f /etc/config/wireless ] && cp /etc/config/wireless /etc/config/wireless.pre-broadcom-wl
+
+mkdir -p /firmadyne/libnvram /firmadyne/libnvram.override
+
+cat > /etc/config/wireless <<'EOF'
+config wifi-device 'radio0'
+	option type 'broadcom'
+	option band '2g'
+	option channel 'auto'
+	option htmode 'HT20'
+	option country '00'
+	option disabled '1'
+
+config wifi-iface 'default_radio0'
+	option device 'radio0'
+	option network 'lan'
+	option mode 'ap'
+	option ssid 'OpenWrt'
+	option encryption 'none'
+
+config wifi-device 'radio1'
+	option type 'broadcom'
+	option band '5g'
+	option channel 'auto'
+	option htmode 'VHT80'
+	option country '00'
+	option disabled '1'
+
+config wifi-iface 'default_radio1'
+	option device 'radio1'
+	option network 'lan'
+	option mode 'ap'
+	option ssid 'OpenWrt'
+	option encryption 'none'
+EOF
+
+exit 0

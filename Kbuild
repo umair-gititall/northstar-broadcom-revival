@@ -59,6 +59,13 @@ ccflags-y := -Wno-unused-function -Wno-missing-prototypes \
 	     -I$(src)/vendor/shared/bcmwifi/include \
 	     $(WLFLAGS) $(WLDEBUG)
 
+# OpenWrt kernels build with CONFIG_WERROR=y, so any warning is fatal. This is
+# a vendored 2.6.36 blob port: the shim deliberately re-declares APIs that the
+# modern headers no longer declare (-Wmissing-declarations) and calls the
+# long-deprecated flush_workqueue()/flush_scheduled_work() (-Wattribute-warning).
+# Keep the output visible but non-fatal, as it was under Buildroot (no WERROR).
+ccflags-y += -Wno-error
+
 # Ported one at a time; each replaces a slice of the 176 weak stubs.
 # Full list: aiutils bcmotp bcmsrom bcmutils hnddma hndpmu linux_osl nicpci
 #            sbutils siutils
