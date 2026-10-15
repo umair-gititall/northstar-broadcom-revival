@@ -42,17 +42,19 @@ about, calls `get_ifname_by_wlmac()` to find which bridge that radio belongs
 to, and stores the *bridge* as `cb->ifname`; `eapd_add_brcm()` then binds one
 socket per bridge. So:
 
-- **WPA needs a bridge.** `BRIDGE=br0` is not optional once `PSK` is set.
+- **WPA needs a bridge.** The radios have to be on a bridge (the default
+  `br-lan`) for the handshake to have anywhere to happen.
 - **`lan_ifnames` must list `wl0`/`wl1` and `lan_ifname` must name the
   bridge**, because that lookup is exactly what `get_ifname_by_wlmac()`
   performs. Naming the radios on eapd's command line does *not* substitute:
   the command line says which radios to care about, nvram says where they
-  live. `wl-setup.sh` appends to `lan_ifnames` rather than replacing it.
+  live. `bcw_security_start()` (in `common.sh`) appends to `lan_ifnames`
+  rather than replacing it.
 
 So `nas` started on its own comes up perfectly, reports nothing wrong, and
 blocks in `select()` forever having never seen an association. FreshTomato's
 `start_nas()` (`router/rc/wnas.c`) launches `eapd` first for this reason, and
-`wl-setup.sh` mirrors that order.
+`bcw_security_start()` mirrors that order.
 
 ## The two bugs it took to get there
 
@@ -107,7 +109,7 @@ Broadcom tree on this machine. So `"Unable to auto config. Quitting..."` and
 simply vanished. Restored here to honour `eapd_msg_level`, which is what it
 exists for, and eapd is now built `-DBCMDBG` — without it the `eapd_dbg` nvram
 read is not compiled either, so the level could never be raised. Errors print
-by default; `nvram set eapd_dbg=3` adds the informational trace.
+by default; `broadcom-wl-ctl nvset eapd_dbg 3` adds the informational trace.
 
 Restoring `EAPD_INFO` exposed two call sites that reference an `eabuf` that
 was never declared, because they had never been compiled. Both marked
@@ -149,7 +151,12 @@ libshared's `wlif_utils.c`, which reads:
 | `wl<N>_mfp`, `wl<N>_preauth`, `wl<N>_nas_dbg` | management frame protection, pre-auth, per-interface debug |
 | `wl<N>_radius_*`, `wl<N>_net_reauth` | enterprise only; inert while `auth_mode` is `none` |
 
-`wl-setup.sh` sets all of them.
+From the UCI `encryption`/`key` the integration writes `akm`, `crypto`,
+`wpa_psk`, `auth` and `auth_mode` (plus `wep`) via `bcw_apply_encryption()`;
+`ssid`/`mode`/`radio`/`bss_enabled` come from the other UCI fields
+(`bcw_radio_apply()`), and the enterprise-only keys (`wpa_gtk_rekey`, `mfp`,
+`preauth`, `radius_*`, `net_reauth`) are left unset, where `get_wsec()` treats
+them as off.
 
 ## Two missing libshared symbols
 
@@ -205,44 +212,51 @@ Notes on the flags, all in the Makefiles:
 
 ## Running
 
+Normal operation starts both daemons from the netifd handler, once the radio is
+up and bridged: the handler calls `broadcom-wl-ctl security-start <bridge>`,
+which seeds `lan_ifname`/`lan_ifnames` and starts `eapd` then `nas` — but only
+if some radio actually carries WPA (`bcw_any_wpa()`), so an open config starts
+neither. To do it by hand, set the keys `get_wsec()` reads and call it directly:
+
 ```sh
-scp userspace/eapd/eapd userspace/nas/nas root@router:/opt/
-# on the router:
-cd /opt && PSK=somepassphrase BRIDGE=br0 ./wl-setup.sh
+broadcom-wl-ctl nvset wl0_akm psk2
+broadcom-wl-ctl nvset wl0_crypto aes
+broadcom-wl-ctl nvset wl0_wpa_psk 'somepassphrase'
+broadcom-wl-ctl security-start br-lan
 ```
 
-`PSK` unset keeps the original open network and does not start either daemon —
-that is still the baseline to fall back to. `AKM` (default `psk2`), `CRYPTO`
-(default `aes`) and `GTK_REKEY` override the rest.
+With no `wl<N>_akm` set the network stays open and neither daemon starts — that
+is still the baseline to fall back to.
 
 `eapd` is given its interfaces explicitly (`eapd -nas wl0 wl1`) rather than
 through its `EAPD_WKSP_AUTO_CONFIG` path, which enumerates `lan_ifnames`. That
 is a narrower use of the variable, not an avoidance of it: `lan_ifnames` still
-has to contain the radios, because that is how eapd finds their bridge. The
-script appends to it and leaves the existing entries alone.
+has to contain the radios, because that is how eapd finds their bridge.
+`bcw_security_start()` appends to it and leaves the existing entries alone.
 
 Both daemonise with `daemon(1, 1)` *after* initialising, so an init failure is
-reported in the foreground by a non-zero exit; the script also checks `pidof`
-a second later, because `nas` can still exit after the fork if `get_wsec()`
-rejects every interface. `pkill`/`pgrep` are deliberately not used — Tomato64's
-busybox has neither applet.
+reported in the foreground by a non-zero exit. `bcw_security_start()` guards
+each launch with `pidof` so it never double-starts, and captures each daemon's
+output under `/var/run/broadcom-wl/`. `pkill`/`pgrep` are deliberately not used
+— the target's busybox has neither applet.
 
 ## Turning the logging on
 
 ```sh
-nvram set nas_dbg=1         # global: nas's workspace trace (debug_nwksp)
-nvram set wl0_nas_dbg=1     # per interface; read by get_wsec into nas->debug
-nvram set eapd_dbg=3        # eapd: 1 = errors (default), 3 = + interface trace
-kill -USR1 $(pidof eapd)    # eapd dumps its interface/socket table
+broadcom-wl-ctl nvset nas_dbg 1        # global: nas's workspace trace (debug_nwksp)
+broadcom-wl-ctl nvset wl0_nas_dbg 1    # per interface; read by get_wsec into nas->debug
+broadcom-wl-ctl nvset eapd_dbg 3       # eapd: 1 = errors (default), 3 = + interface trace
+kill -USR1 $(pidof eapd)               # eapd dumps its interface/socket table
 ```
 
 `nas_dbg` and `wl<N>_nas_dbg` are different switches: the global one drives
 `NASDBG()` in the workspace layer, the per-interface one drives `dbg()` inside
-the state machine. `wl-setup.sh` sets both from `NAS_DBG=`, and `eapd_dbg`
-from `EAPD_DBG=`.
+the state machine. Set any of them with `broadcom-wl-ctl nvset <key> <value>`
+(e.g. `broadcom-wl-ctl nvset wl0_nas_dbg 1`).
 
-Because both daemonise with `noclose=1`, their output stays on the terminal
-that started them.
+Started by hand, both daemonise with `noclose=1`, so their output stays on the
+terminal that launched them; the netifd handler instead redirects each daemon's
+output to `/var/run/broadcom-wl/{eapd,nas}.log`.
 
 ## When something crashes
 

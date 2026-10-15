@@ -43,8 +43,9 @@ FreshTomato's `src-rt-6.x.4708` copy, so the ioctl ABI already lines up.
 make -C userspace/wlconf
 ```
 
-Standalone against Tomato64's already-built `libnvram`/`libshared`, rather than
-as a Buildroot package — get it working first, package once it does. Two
+Standalone, against the vendored `libnvram`/`libshared`, rather than through the
+OpenWrt package — the per-component Makefiles are for development, and the root
+`Makefile` builds and packages everything (see the repository README). Two
 gotchas, both handled in the Makefile:
 
 - **Do not pass `shadow/wlflags`.** Those are the *driver's* flags and include
@@ -61,23 +62,46 @@ vendored for the kernel work.
 
 ## Running
 
+Normal operation is UCI-driven: `/etc/config/wireless` holds two `wifi-device`
+sections of `option type 'broadcom'`, and the netifd handler maps each onto the
+`wl<N>_*` keys `wlconf` reads and runs it for you (see the repository README).
+What the handler does per radio is, in effect:
+
+1. `broadcom-wl-ctl apply <spec>` — write the `wl<N>_*` keys from a
+   shell-sourceable spec it builds from the UCI section;
+2. `broadcom-wl-ctl up <unit>` — run `wlconf wl<unit> up` then
+   `wlconf wl<unit> start`.
+
+To exercise that by hand, write a spec and run the same two commands:
+
 ```sh
-scp userspace/wlconf/wlconf userspace/wlconf/wl-setup.sh root@router:/tmp/
-# on the router:
-cd /tmp && ./wl-setup.sh
+cat > /tmp/wl0.spec <<'EOF'
+RADIO='radio0'
+UNIT='0'
+BAND='2g'
+CHANNEL='1'
+HTMODE='NOHT'
+COUNTRY='US'
+IFACE_0_SECTION='default_radio0'
+IFACE_0_MODE='ap'
+IFACE_0_SSID='MyNet'
+IFACE_0_ENC='none'
+EOF
+broadcom-wl-ctl apply /tmp/wl0.spec
+broadcom-wl-ctl up 0
 ```
 
-`wl-setup.sh` sets the 70-odd variables `wlconf` actually reads — values taken
-from FreshTomato's own defaults, with the essentials overridden — then brings
-both radios up. Override with the environment:
+`wlconf` reads its configuration entirely from the `wl<N>_*` variables in the
+firmadyne NVRAM store (`/firmadyne/libnvram`, written through
+`broadcom-wl-ctl nvset`). The keys that matter for bring-up — `phytype`,
+`nband`, `channel`, `nmode`/`vhtmode`/`bw_cap`, `country_code`, `ssid`,
+`akm`/`crypto`/`psk` … — come from the spec, with values chosen to match
+FreshTomato; the rest read through `nvram_safe_get()`, where a missing key is
+`""` and `atoi("")` is `0`.
 
-```sh
-SSID24=MyNet CHAN24=1 COUNTRY=US ./wl-setup.sh
-```
-
-It starts with an **open** network (`akm=""`, `wep=disabled`) deliberately:
-fewest moving parts for a first association test. Encryption needs `nas` and
-comes after.
+The spec above is an **open** network (`ENC='none'`: `akm=""`, `wep=disabled`)
+deliberately — fewest moving parts for a first association test. Encryption
+needs `nas` and comes after (see `../nas/README.md`).
 
 ## `up` is not enough: you also need `start`
 
@@ -113,8 +137,10 @@ FreshTomato's `rc` does three steps in this order, in `network.c`:
 2. build the LAN bridge and add the wl interfaces to it
 3. `eval("wlconf", ifname, "start")` — line 922
 
-`wl-setup.sh` now mirrors that. Step 2 is optional there: `BRIDGE=br0
-./wl-setup.sh`.
+`broadcom-wl-ctl up` collapses steps 1 and 3 into one command — it runs `up`
+then `start` back to back. Step 2 is netifd's: the handler calls `set_vif()`
+for each AP interface and netifd puts them on the bridge named by the section's
+`network` (default `br-lan`), once `set_up()` fires.
 
 ## Reading wlconf's output
 
@@ -158,8 +184,8 @@ force and nothing was lost. If it reports 1, this is not cosmetic.
 
 ### The one that was real: `wlX_phytype`
 
-Every variable in `wl-setup.sh` was a FreshTomato default except that this one
-is not inert. wlconf uses it to pick the band:
+Every variable the integration writes comes from a FreshTomato default, but
+this one is not inert. wlconf uses it to pick the band:
 
 ```c
 val = str ? WLCONF_STR2PHYTYPE(str[0]) : PHY_TYPE_G;
@@ -175,9 +201,10 @@ was being **ignored** and both radios were being forced to 2.4 GHz. wl1 then
 failed `WLC_SET_BAND` twice and only landed on 5 GHz through wlconf's "card may
 have changed" fallback, which re-reads `WLC_GET_BANDLIST`.
 
-dmesg reports `phy_type 11` (`PHY_TYPE_AC`) for both radios, so the script now
-sets `phytype=v`. The band choice is then deliberate rather than salvaged from
-an error path, and the two `cmd=142` failures go away.
+dmesg reports `phy_type 11` (`PHY_TYPE_AC`) for both radios, so the integration
+now sets `phytype=v` (`bcw_radio_apply()`). The band choice is then deliberate
+rather than salvaged from an error path, and the two `cmd=142` failures go
+away.
 
 FreshTomato does not rely on the `defaults.c` value either. Its `rc` overwrites
 it at runtime, immediately before calling `wlconf`, from the driver itself
@@ -197,19 +224,18 @@ that code would compute on this hardware.
 
 `wlconf` tells you nothing about the result. `../wldiag` asks the driver
 directly over the same private-ioctl path — radio up, BSS started, SSID, BSSID,
-channel, country, associated stations:
+channel, country, associated stations. The package installs it to `/usr/sbin`:
 
 ```sh
-make -C userspace/wldiag
-scp userspace/wldiag/wldiag root@router:/opt/
+wldiag wl0                 # full state dump
 ```
 
-`wl-setup.sh` runs it automatically if it is alongside. It also takes single
-queries, which is how to check anything the dump does not cover:
+It also takes single queries, which is how to check anything the dump does not
+cover:
 
 ```sh
-./wldiag wl0 ioctl 230     # WLC_GET_WET
-./wldiag wl0 iovar mbss
+wldiag wl0 ioctl 230       # WLC_GET_WET
+wldiag wl0 iovar mbss
 ```
 
 FreshTomato's own `wl` tool would be the natural thing to use, but the tree
@@ -218,8 +244,13 @@ it, so this covers the subset bring-up needs.
 
 ## Packaging
 
-Not packaged for Buildroot yet, on purpose. `wlconf.c`'s own Makefile header
-declares it *"UNPUBLISHED PROPRIETARY SOURCE CODE of Broadcom Corporation"*, so
-it belongs in this repo — which has no remote — rather than in the Tomato64
-tree, unless that tree's sources stay private. A Tomato64 package that copies
-the source in from outside the tree at build time would keep that separation.
+`wlconf.c` is Broadcom's, and its own header declares it *"UNPUBLISHED
+PROPRIETARY SOURCE CODE of Broadcom Corporation"*. It is vendored here for the
+same reason the other Broadcom sources are (see `vendor/README.md`): nothing
+else speaks the driver's private ABI, and the prebuilt `wl` tool ships no source
+to adapt.
+
+The split this repo draws is between **source**, which is committed, and the
+**binary blobs** (`wl_apsta.o`, the prebuilt `wl`), which are not: `fetch.sh`
+retrieves those from the vendor's published tree at a pinned, hash-verified
+revision. See the repository README's licensing section.
