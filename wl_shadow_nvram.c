@@ -26,6 +26,54 @@
 static char *wl_nvram_buf;	/* NUL-separated name=value entries */
 static size_t wl_nvram_len;
 
+/*
+ * Runtime NVRAM defaults.
+ *
+ * Broadcom's wl driver is built to sit on top of FreshTomato, whose /sbin/rc
+ * commits a set of wl_* keys into NVRAM every boot. A stock OpenWrt bcm53xx
+ * NVRAM partition only carries the CFE/factory keys (boardtype, devpath0,
+ * 0:sromrev, pci/1/1/..., ...) - the runtime wl_ keys are not there.
+ *
+ * wl_module_init() reads several of them through getvar() (= nvram_get()) and
+ * is careless with two of them:
+ *
+ *   str   = getvar(NULL, "wl_ifnames");        // -> nvram_get()
+ *   strspn(str, " ");                          // no NULL check
+ *
+ *   getvar(NULL, "wl0_igs") -> bcm_strtoul();  // no NULL check, per radio
+ *
+ * Those are the only two unchecked getvar() call sites in the whole blob
+ * (everything else NULL-tests first). On FreshTomato wl_ifnames is always
+ * "wl0 wl1" (defaults.c, BCM53XX) and the per-radio wlN_igs are present, so
+ * the missing checks never fire. On stock OpenWrt the very first call -
+ * strspn(NULL, " ") - faults at kernel strspn with r0 == 0, which is exactly
+ * the oops at PC 0xc0878528 / LR wl .init.text+0x80 that this fixes.
+ *
+ * Supply the keys FreshTomato would have supplied. Lookups first fall through
+ * to the real NVRAM, so a partitioned NVRAM that does define them still wins.
+ */
+static char wl_def_ifnames[] = "wl0 wl1";
+static char wl_def_zero[] = "0";
+
+static const struct wl_nvram_default {
+	const char *name;
+	char *value;
+} wl_nvram_defaults[] = {
+	{ "wl_ifnames",	wl_def_ifnames },
+	{ "wl0_igs",	wl_def_zero },
+	{ "wl1_igs",	wl_def_zero },
+};
+
+static char *wl_nvram_default_lookup(const char *name)
+{
+	size_t i;
+
+	for (i = 0; i < ARRAY_SIZE(wl_nvram_defaults); i++)
+		if (!strcmp(name, wl_nvram_defaults[i].name))
+			return wl_nvram_defaults[i].value;
+	return NULL;
+}
+
 static int wl_nvram_load(void)
 {
 	size_t len = 0;
@@ -75,17 +123,20 @@ char *nvram_get(const char *name)
 	size_t nlen;
 	char *p;
 
-	if (!name || wl_nvram_load())
+	if (!name)
 		return NULL;
 
-	nlen = strlen(name);
-	for (p = wl_nvram_buf; p < wl_nvram_buf + wl_nvram_len; p += strlen(p) + 1) {
-		if (!*p)
-			continue;
-		if (!strncmp(p, name, nlen) && p[nlen] == '=')
-			return p + nlen + 1;
+	if (!wl_nvram_load()) {
+		nlen = strlen(name);
+		for (p = wl_nvram_buf; p < wl_nvram_buf + wl_nvram_len; p += strlen(p) + 1) {
+			if (!*p)
+				continue;
+			if (!strncmp(p, name, nlen) && p[nlen] == '=')
+				return p + nlen + 1;
+		}
 	}
-	return NULL;
+
+	return wl_nvram_default_lookup(name);
 }
 
 int nvram_getall(char *buf, int count)
