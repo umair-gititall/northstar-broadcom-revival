@@ -65,6 +65,7 @@ define Build/Prepare
 		$(CURDIR)/wl_shadow*.c $(CURDIR)/wl_shadow*.h \
 		$(CURDIR)/wl_shim_removed.c \
 		$(CURDIR)/shadow $(CURDIR)/vendor $(CURDIR)/userspace \
+		$(CURDIR)/iwinfo \
 		$(PKG_BUILD_DIR)/
 	# Drop artifacts a previous standalone build left in the tree, so the
 	# sub-makes cannot mistake a host- or stale-compiled object for current.
@@ -74,13 +75,15 @@ define Build/Prepare
 	-rm -f $(PKG_BUILD_DIR)/vendor/libnvram/*.o $(PKG_BUILD_DIR)/vendor/libnvram/*.so
 	-rm -f $(PKG_BUILD_DIR)/vendor/libshared/*.o $(PKG_BUILD_DIR)/vendor/libshared/*.so
 	-rm -f $(PKG_BUILD_DIR)/userspace/uclibc-compat/wl $(PKG_BUILD_DIR)/userspace/uclibc-compat/uclibc.so
+	-$(MAKE) -C $(PKG_BUILD_DIR)/iwinfo clean
 endef
 
-# Four steps, in order:
+# Five steps, in order:
 #   1. objcopy the blob (Makefile.standalone) into wl_apsta.o_shipped;
 #   2. kbuild the module (Kbuild reads vendor/, shadow/ beside it);
 #   3. the two vendored userspace libraries;
-#   4. the tools, which link against those libraries.
+#   4. the tools, which link against those libraries;
+#   5. the wl-enabled libiwinfo userspace library.
 #
 # OBJCOPY is passed explicitly: the blob must be relinked with the *target*
 # binutils, not the host's (a host objcopy silently produces an object the
@@ -95,6 +98,9 @@ define Build/Compile
 		CC="$(TARGET_CC)" CFLAGS="$(TARGET_CFLAGS)"
 	+$(MAKE) -C $(PKG_BUILD_DIR) -f Makefile.standalone userspace \
 		CC="$(TARGET_CC)" AR="$(TARGET_CROSS)ar" CROSS_COMPILE="$(TARGET_CROSS)"
+	# The wl-enabled libiwinfo. Built last, standalone: it needs nothing from
+	# the rest of the tree and only links against libc (see iwinfo/Makefile).
+	+$(MAKE) -C $(PKG_BUILD_DIR)/iwinfo CC="$(TARGET_CC)" CFLAGS="$(TARGET_CFLAGS)"
 endef
 
 define Package/broadcom-wl/install
@@ -106,6 +112,16 @@ define Package/broadcom-wl/install
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/userspace/uclibc-compat/wl $(1)/usr/sbin/wl
 	$(INSTALL_DATA) $(PKG_BUILD_DIR)/vendor/libnvram/libnvram.so $(1)/usr/lib/libnvram.so
 	$(INSTALL_DATA) $(PKG_BUILD_DIR)/vendor/libshared/libshared.so $(1)/usr/lib/libshared.so
+
+	# wl-enabled libiwinfo. It is NOT installed at the canonical
+	# /usr/lib/libiwinfo.so.20230701: that path belongs to the stock
+	# libiwinfo package, and claiming it here would be an apk file conflict.
+	# Instead it lives in our own directory and postinst (re)points the
+	# canonical name at it, moving the stock file safely aside (see
+	# common.sh:bcw_iwinfo_install for the details of the swap).
+	$(INSTALL_DIR) $(1)/usr/lib/broadcom-wl
+	$(INSTALL_DATA) $(PKG_BUILD_DIR)/iwinfo/libiwinfo.so.20230701 \
+		$(1)/usr/lib/broadcom-wl/libiwinfo.so.20230701
 
 	# The uClibc-ABI shim. `wl` is a prebuilt uClibc binary; it loads this as
 	# its libc (DT_NEEDED was rewritten libc.so.0 -> uclibc.so to dodge musl's
@@ -135,16 +151,24 @@ define Package/broadcom-wl/postinst
 		loader="$$(ls /lib/ld-musl-*.so.1 2>/dev/null | head -n1)"
 		[ -n "$$loader" ] && ln -sf "$$loader" /lib/ld-uClibc.so.0
 	fi
+	# Point the canonical libiwinfo path at our wl-enabled build so rpcd-mod-luci
+	# can describe the radios. Also re-asserted from init.d at every boot, in
+	# case a libiwinfo package upgrade clobbers the symlink.
+	[ -x /usr/sbin/broadcom-wl-ctl ] && /usr/sbin/broadcom-wl-ctl iwinfo-install 2>/dev/null
 }
 exit 0
 endef
 
-# Put back any stock netifd wireless handler the package moved aside (see
-# common.sh:handler-single for why), so removing the package restores a
-# pristine system.
+# Undo the two things this package swaps into the running system: the stock
+# netifd wireless handler it moved aside (common.sh:handler-single) and the
+# stock libiwinfo it symlinked over (common.sh:bcw_iwinfo_install). Removing the
+# package then leaves a pristine system.
 define Package/broadcom-wl/prerm
 #!/bin/sh
-[ -n "$${IPKG_INSTROOT}" ] || /usr/sbin/broadcom-wl-ctl handler-restore 2>/dev/null
+[ -n "$${IPKG_INSTROOT}" ] || {
+	[ -x /usr/sbin/broadcom-wl-ctl ] && /usr/sbin/broadcom-wl-ctl iwinfo-restore 2>/dev/null
+	/usr/sbin/broadcom-wl-ctl handler-restore 2>/dev/null
+}
 exit 0
 endef
 

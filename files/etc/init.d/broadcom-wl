@@ -24,7 +24,17 @@ start() {
 	# /lib/netifd/wireless/*.sh; two handlers there make netifd busy-spin.
 	/usr/sbin/broadcom-wl-ctl handler-single
 
+	# Point libiwinfo.so.20230701 at the wl-enabled build this package ships
+	# (rpcd-mod-luci dlopens it to describe the radios to LuCI). Re-asserted
+	# every boot so a stock libiwinfo upgrade cannot quietly take it back.
+	/usr/sbin/broadcom-wl-ctl iwinfo-install
+
 	/usr/sbin/broadcom-wl-ctl seed
+
+	# Heal a /etc/config/wireless whose band was dropped by LuCI while the
+	# stock nl80211-only libiwinfo made its frequency widget fail. Must run
+	# before netifd (START=20) reads the config.
+	/usr/sbin/broadcom-wl-ctl config-repair
 
 	# b43 owns the radios until we take them.
 	rmmod b43 2>/dev/null

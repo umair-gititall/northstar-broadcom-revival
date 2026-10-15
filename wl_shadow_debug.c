@@ -134,3 +134,19 @@ MODULE_PARM_DESC(dma_trace, "number of DMA tx enqueue/complete events to log (0 
 int wl_rx_trace;
 module_param_named(rx_trace, wl_rx_trace, int, 0644);
 MODULE_PARM_DESC(rx_trace, "number of received frames to log (0 = off)");
+
+/*
+ * Synthesized-XID drop tracing, off by default.
+ *
+ * `insmod wl.ko xid_trace=20` logs 20 of the driver's own 802.2 XID roaming
+ * frames as the transmit trampoline discards them. Broadcom's wlc_ap()
+ * synthesizes one on every association and hands it up so the bridge learns
+ * the station; the bridge then floods the broadcast back out the radios,
+ * where wlc_sendpkt() would read it as an L2 roaming advertisement and free
+ * the station it was just told about. Dropping it is what keeps the station
+ * associated, and this counter is how you confirm the drop is what happened
+ * rather than inferring it from a deauth that no longer occurs.
+ */
+int wl_xid_trace;
+module_param_named(xid_trace, wl_xid_trace, int, 0644);
+MODULE_PARM_DESC(xid_trace, "number of synthesized XID frames to log (0 = off)");

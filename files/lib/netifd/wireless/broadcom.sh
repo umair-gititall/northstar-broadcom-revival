@@ -89,6 +89,40 @@ function resolve_ifname(band) {
 	return s ? split(s, '\n')[0] : '';
 }
 
+// The numeric part of a radio section name (radio0 -> 0), or -1.
+function radio_index(name) {
+	let m = match(name ?? '', /([0-9]+)$/);
+	return m ? int(m[1]) : -1;
+}
+
+// Band to use when the device config carries neither band nor hw_mode. This
+// board has exactly one radio per band, so fall back to the factory order
+// (radio0 => 2.4GHz, radio1 => 5GHz). Crucially this must not be a constant:
+// defaulting every radio to 2g makes both resolve to wl1, so the 5GHz radio is
+// never reconfigured and keeps beaconing its old SSID while the new SSID lands
+// on the 2.4GHz radio. That is the "renaming the SSID leaves the old one up"
+// bug: LuCI drops band/channel/htmode on save whenever its frequency widget
+// fails, which the stock nl80211-only libiwinfo made it do every time.
+function default_band(name) {
+	return (radio_index(name) == 1) ? '5g' : '2g';
+}
+
+// Resolve the band for a radio: explicit band, else hw_mode, else the board
+// default. Shared by setup() and teardown() so they always agree on which
+// netdev a radio is.
+function resolve_band(config, radio) {
+	if (config.band)
+		return config.band;
+	switch (config.hw_mode) {
+	case '11a':
+		return '5g';
+	case '11b':
+	case '11g':
+		return '2g';
+	}
+	return default_band(radio);
+}
+
 // The bridge a wireless iface is attached to. netifd names bridges br-<network>
 // for a bridge protocol on <network>; the default is br-lan.
 function iface_bridge(cfg) {
@@ -156,18 +190,8 @@ function setup() {
 		return 0;
 	}
 
-	let band = config.band;
-	if (!band) {
-		switch (config.hw_mode) {
-		case '11a':
-			band = '5g';
-			break;
-		default:
-			band = '2g';
-			break;
-		}
-		config.band = band;
-	}
+	let band = resolve_band(config, radio);
+	config.band = band;
 
 	validate('device', config);
 
@@ -239,7 +263,7 @@ function setup() {
 function teardown() {
 	let data = json(ARGV[3]);
 	let config = data.config ?? {};
-	let band = config.band ?? '2g';
+	let band = resolve_band(config, ARGV[2]);
 	let ifname = resolve_ifname(band);
 
 	run('/usr/sbin/broadcom-wl-ctl security-stop');

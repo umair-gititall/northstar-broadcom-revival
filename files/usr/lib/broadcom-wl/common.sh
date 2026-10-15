@@ -482,6 +482,93 @@ bcw_restore_handler() {
 }
 
 # ---------------------------------------------------------------------------
+# libiwinfo: provide the wl-enabled build at the canonical path
+# ---------------------------------------------------------------------------
+#
+# rpcd-mod-luci (LuCI's luci-rpc getWirelessDevices) describes the radios by
+# dlopen()ing /usr/lib/libiwinfo.so* and dlsym()ing iwinfo_backend() and the
+# IWINFO_*_NAMES tables. The stock libiwinfo is built with the nl80211 backend
+# only, so on this cfg80211-less board every call fails and LuCI falls back to
+# "Generic / unknown" with no channel, bitrate or station list.
+#
+# This package ships the same iwinfo built with the Broadcom `wl' backend (plus
+# wext, which the wl backend delegates to). It cannot be installed at the
+# canonical path directly -- that file belongs to the stock libiwinfo package,
+# and a second package owning it is an apk file conflict -- so it lives in
+# /usr/lib/broadcom-wl/ and the canonical name is pointed at it here, with the
+# stock file moved safely aside. prerm undoes both moves.
+#
+# The backup name deliberately does NOT match the /usr/lib/libiwinfo.so* glob
+# rpcd scans, or it would find two libraries.
+
+BCW_IFWIN_CANON="/usr/lib/libiwinfo.so.20230701"
+BCW_IFWIN_SHIPPED="broadcom-wl/libiwinfo.so.20230701"
+BCW_IFWIN_BACKUP="/usr/lib/broadcom-wl/libiwinfo.so.20230701.stock"
+
+bcw_iwinfo_install() {
+	[ -e "/usr/lib/$BCW_IFWIN_SHIPPED" ] || return 0
+
+	# Already pointing at us (init runs every boot)? Nothing to do.
+	if [ -L "$BCW_IFWIN_CANON" ] && \
+	   [ "$(readlink "$BCW_IFWIN_CANON" 2>/dev/null)" = "$BCW_IFWIN_SHIPPED" ]; then
+		return 0
+	fi
+
+	# Move a real stock library aside, once. A symlink left over from a
+	# removed package is simply replaced.
+	if [ -e "$BCW_IFWIN_CANON" ] && [ ! -L "$BCW_IFWIN_CANON" ]; then
+		mkdir -p "$(dirname "$BCW_IFWIN_BACKUP")"
+		mv -f "$BCW_IFWIN_CANON" "$BCW_IFWIN_BACKUP" 2>/dev/null
+	fi
+
+	ln -sf "$BCW_IFWIN_SHIPPED" "$BCW_IFWIN_CANON"
+}
+
+bcw_iwinfo_restore() {
+	[ -L "$BCW_IFWIN_CANON" ] && rm -f "$BCW_IFWIN_CANON"
+	[ -e "$BCW_IFWIN_BACKUP" ] && mv -f "$BCW_IFWIN_BACKUP" "$BCW_IFWIN_CANON" 2>/dev/null
+	return 0
+}
+
+# ---------------------------------------------------------------------------
+# /etc/config/wireless repair
+# ---------------------------------------------------------------------------
+#
+# LuCI's frequency widget calls rpcd `iwinfo freqlist'; with the stock
+# nl80211-only libiwinfo that fails, and the widget then clears band, channel
+# and htmode when the section is saved (this is what emptied the radios here).
+# The missing `band' is what let both radios resolve to the same netdev (see
+# the netifd handler). With the wl-enabled libiwinfo installed this no longer
+# happens, but a config already damaged in the field has to be healed once.
+#
+# Only touches broadcom wifi-device sections that have neither band nor hwmode:
+# an operator-set value is never overwritten, and 2g/5g is assigned by radio
+# order, matching the factory default and the handler's own fallback.
+
+bcw_radio_config_repair() {
+	command -v uci >/dev/null 2>&1 || return 0
+	_changed=0
+	_idx=-1
+	for _sec in $(uci -q show wireless 2>/dev/null | \
+		sed -n 's/^wireless\.\([^.]*\)=wifi-device$/\1/p'); do
+		[ "$(uci -q get "wireless.$_sec.type")" = broadcom ] || continue
+		_idx=$((_idx + 1))
+		[ -n "$(uci -q get "wireless.$_sec.band")" ] && continue
+		[ -n "$(uci -q get "wireless.$_sec.hwmode")" ] && continue
+		case "$_idx" in
+		0) _band=2g ;;
+		1) _band=5g ;;
+		*) _band=2g ;;
+		esac
+		uci set "wireless.$_sec.band=$_band"
+		_changed=1
+		logger -t broadcom-wl "wireless.$_sec: restored missing band ($_band)"
+	done
+	[ "$_changed" = 1 ] && uci commit wireless
+	return 0
+}
+
+# ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 
@@ -493,13 +580,16 @@ bcw_main() {
 	seed)    bcw_seed_defaults ;;
 	handler-single)  bcw_single_handler ;;
 	handler-restore) bcw_restore_handler ;;
+	iwinfo-install)  bcw_iwinfo_install ;;
+	iwinfo-restore)  bcw_iwinfo_restore ;;
+	config-repair)   bcw_radio_config_repair ;;
 	security-start) shift; bcw_security_start "$@" ;;
 	security-stop)  bcw_security_stop ;;
 	ifname)  bcw_band_to_ifname "$2" ;;
 	nvset)   bcw_nvset "$2" "$3" ;;
 	nvget)   bcw_nvget "$2" ;;
 	*)
-		echo "usage: broadcom-wl-ctl {seed|handler-single|handler-restore|apply <file>|up <unit>|down <unit>|security-start <if> <bridge>|security-stop|ifname <band>|nvset <k> <v>|nvget <k>}" >&2
+		echo "usage: broadcom-wl-ctl {seed|handler-single|handler-restore|iwinfo-install|iwinfo-restore|config-repair|apply <file>|up <unit>|down <unit>|security-start <if> <bridge>|security-stop|ifname <band>|nvset <k> <v>|nvget <k>}" >&2
 		return 1
 		;;
 	esac

@@ -80,4 +80,13 @@ extern int wl_dma_trace;
  */
 extern int wl_rx_trace;
 
+/*
+ * Synthesized-XID drop tracing, set with the xid_trace= module parameter.
+ * Same counting-down shape as wl_dma_trace. Logs each IEEE 802.2 XID roaming
+ * frame the kernel floods back to a radio, which the transmit trampoline
+ * discards before the blob can mistake it for a station move. See the long
+ * comment in wl_tramp_start_xmit().
+ */
+extern int wl_xid_trace;
+
 #endif /* WL_SHADOW_H */

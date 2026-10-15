@@ -1,0 +1,4 @@
+# Build outputs from a manual `make` in this directory (the package build
+# compiles a copy under $(PKG_BUILD_DIR) and leaves this tree clean).
+*.o
+libiwinfo.so*

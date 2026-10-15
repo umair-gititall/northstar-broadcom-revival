@@ -14,6 +14,7 @@
 #include <linux/slab.h>
 #include <linux/netdevice.h>
 #include <linux/etherdevice.h>
+#include <linux/if_ether.h>
 #include <linux/list.h>
 #include <linux/spinlock.h>
 #include <linux/errno.h>
@@ -124,6 +125,55 @@ static int wl_tramp_stop(struct net_device *real)
  */
 static atomic_t wl_xmit_notok = ATOMIC_INIT(0);
 
+/*
+ * Broadcom's wlc_ap() synthesizes an IEEE 802.2 XID frame on every station
+ * association and hands it to wl_sendup() so the local bridge learns the
+ * station's MAC on the wireless port. That is the frame the rx_trace output
+ * shows as `ffffffffffff <STA_MAC> 0006 | 0001af...`: DA broadcast, the
+ * station as source, a 2-byte length of 6 and six bytes of LLC XID payload.
+ *
+ * The learning half of that is fine and is left alone. The trouble is the
+ * second half. The bridge floods the broadcast back out every port, radios
+ * included, and a radio that receives it runs:
+ *
+ *   wl_start() -> wl->txq -> wl_start_txqwork()   (sets cb bit 0x100 on every
+ *                                                  packet it hands down)
+ *            -> wlc_sendpkt()
+ *
+ * wlc_sendpkt(), seeing a host-originated (0x100) group-addressed 802.3 frame
+ * whose length field is 6 and whose source address matches an SCB, reads it
+ * as an L2 roaming advertisement and calls wlc_scbfree() on that station. On
+ * a single AP the only SCB that can match is the one the station just
+ * created, so it is deleted about ten milliseconds after association; every
+ * data frame afterwards lands on "non-associated station", and the driver
+ * deauths the client with reason 7.
+ *
+ * The XID exists only to update a bridge FDB, and that already happened on
+ * the receive path - putting it on the air serves no purpose. Drop it here,
+ * at the one point where a kernel packet crosses in to a radio, before the
+ * blob can turn it into a roaming notification. Note the 0x100 bit cannot be
+ * cleared to achieve the same thing: the blob sets it itself, inside
+ * wl_start_txqwork(), after this trampoline has already returned.
+ */
+static bool wl_xid_roaming_frame(const struct sk_buff *skb)
+{
+	const u8 *e;
+
+	/* Ethernet header plus the 6-byte 802.2 payload. */
+	if (skb->len < ETH_HLEN + 6 || !skb->data)
+		return false;
+
+	e = skb->data;
+	if (!(e[0] & 0x01))				/* DA group-addressed */
+		return false;
+	if (e[12] != 0x00 || e[13] != 0x06)		/* 802.3 length == 6 */
+		return false;
+	if (e[14] != 0x00 || e[15] != 0x01 || e[16] != 0xaf)	/* LLC XID */
+		return false;
+
+	return true;
+}
+
 static netdev_tx_t wl_tramp_start_xmit(struct sk_buff *skb, struct net_device *real)
 {
 	struct wl_netdev_shadow *sh = shadow_of(real);
@@ -134,6 +184,22 @@ static netdev_tx_t wl_tramp_start_xmit(struct sk_buff *skb, struct net_device *r
 
 	if (!fn) {
 		kfree_skb(skb);
+		return NETDEV_TX_OK;
+	}
+
+	/*
+	 * Swallow the driver's own XID roaming frame before wlc_sendpkt() can
+	 * mistake it for a station move and free the station's SCB. See
+	 * wl_xid_roaming_frame() for the whole story.
+	 */
+	if (wl_xid_roaming_frame(skb)) {
+		if (wl_xid_trace > 0) {
+			wl_xid_trace--;
+			pr_info("wl: %s: dropped synthesized XID roaming frame "
+				"from %pM (kept the station's SCB)\n",
+				real->name, skb->data + ETH_ALEN);
+		}
+		dev_kfree_skb_any(skb);
 		return NETDEV_TX_OK;
 	}
 
