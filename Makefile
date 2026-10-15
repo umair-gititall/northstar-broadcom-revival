@@ -113,8 +113,19 @@ define Package/broadcom-wl/install
 	# whichever musl loader this build ships.
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/userspace/uclibc-compat/uclibc.so $(1)/lib/uclibc.so
 
-	# Integration files (netifd handler, init.d, hotplug, uci-defaults).
-	$(CP) ./files/. $(1)/
+	# Integration files. Every one is an executable script (init.d, hotplug,
+	# uci-defaults, the netifd ucode handler, the ctl wrapper and the sourced
+	# library), so install each with INSTALL_BIN: the exec bit is what makes
+	# them run at boot and what lets netifd load the wireless handler. A plain
+	# $(CP) would carry whatever mode the checkout happens to have.
+	$(INSTALL_DIR) $(1)/usr/lib/broadcom-wl $(1)/lib/netifd/wireless
+	$(INSTALL_DIR) $(1)/etc/init.d $(1)/etc/hotplug.d/iface $(1)/etc/uci-defaults
+	$(INSTALL_BIN) ./files/usr/sbin/broadcom-wl-ctl $(1)/usr/sbin/broadcom-wl-ctl
+	$(INSTALL_BIN) ./files/usr/lib/broadcom-wl/common.sh $(1)/usr/lib/broadcom-wl/common.sh
+	$(INSTALL_BIN) ./files/lib/netifd/wireless/broadcom.sh $(1)/lib/netifd/wireless/broadcom.sh
+	$(INSTALL_BIN) ./files/etc/init.d/broadcom-wl $(1)/etc/init.d/broadcom-wl
+	$(INSTALL_BIN) ./files/etc/hotplug.d/iface/30-broadcom-wl $(1)/etc/hotplug.d/iface/30-broadcom-wl
+	$(INSTALL_BIN) ./files/etc/uci-defaults/99-broadcom-wl $(1)/etc/uci-defaults/99-broadcom-wl
 endef
 
 define Package/broadcom-wl/postinst
@@ -125,6 +136,15 @@ define Package/broadcom-wl/postinst
 		[ -n "$$loader" ] && ln -sf "$$loader" /lib/ld-uClibc.so.0
 	fi
 }
+exit 0
+endef
+
+# Put back any stock netifd wireless handler the package moved aside (see
+# common.sh:handler-single for why), so removing the package restores a
+# pristine system.
+define Package/broadcom-wl/prerm
+#!/bin/sh
+[ -n "$${IPKG_INSTROOT}" ] || /usr/sbin/broadcom-wl-ctl handler-restore 2>/dev/null
 exit 0
 endef
 

@@ -3,7 +3,7 @@
 # Load (or unload) the Broadcom `wl` blob driver on the WZR-1750DHP.
 #
 # The driver is not a bcma driver, so on this board it cannot simply
-# modprobe: the two radios (14e4:4331 2.4GHz, 14e4:43a0 5GHz) are claimed at
+# modprobe: the two radios (14e4:4331 2.4GHz, 14e4:4360 5GHz) are claimed at
 # boot by b43 through the built-in bcma-pci-bridge driver. To hand them to wl
 # we unbind them from that driver and then load wl.ko, whose own pci_driver
 # id-table matches the same two IDs and probes them.
@@ -19,6 +19,11 @@ WL_MODULE=/lib/modules/$(uname -r)/wl.ko
 BCMA_DRV=/sys/bus/pci/drivers/bcma-pci-bridge
 
 start() {
+	# Keep a single netifd wireless handler. Runs at START=19, before the
+	# network service (START=20) spawns netifd, which globs
+	# /lib/netifd/wireless/*.sh; two handlers there make netifd busy-spin.
+	/usr/sbin/broadcom-wl-ctl handler-single
+
 	/usr/sbin/broadcom-wl-ctl seed
 
 	# b43 owns the radios until we take them.

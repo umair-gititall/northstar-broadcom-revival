@@ -46,4 +46,9 @@ config wifi-iface 'default_radio1'
 	option encryption 'none'
 EOF
 
+# netifd globs /lib/netifd/wireless/*.sh and its reader loop spins when more
+# than one handler is present, so leave only ours in the scan path (see
+# files/usr/lib/broadcom-wl/common.sh for the mechanism and rationale).
+/usr/sbin/broadcom-wl-ctl handler-single
+
 exit 0

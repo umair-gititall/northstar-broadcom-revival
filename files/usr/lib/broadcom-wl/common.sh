@@ -50,21 +50,50 @@ bcw_nvget() {
 }
 
 # ---------------------------------------------------------------------------
-# Band / unit mapping
+# Band -> netdev
 # ---------------------------------------------------------------------------
 #
-# On this board the driver attaches two radios and, with intf_name=wl%d, names
-# their primary netdevs wl0 and wl1 in PCI probe order. That order is
-# 2.4GHz-first on the WZR-1750DHP (pci/1/1 then pci/2/1), which is also what
-# the wl0_nband=2 / wl1_nband=5 defaults assume. Map by band, and let an
-# explicit `wl<N>_ifname` win if one was seeded, so a board that enumerates the
-# other way can be corrected from /etc/config/wireless without a code change.
+# With intf_name=wl%d the driver names the two radios' primary netdevs wl0 and
+# wl1 in PCI probe order, and that order is *not* the band order. On the
+# WZR-1750DHP the 5GHz BCM4360 enumerates before the 2.4GHz BCM4331, so wl0 is
+# the 5GHz radio and wl1 is 2.4GHz. LuCI addresses radios by band (option band
+# '2g'/'5g'), so the name has to be resolved, not assumed.
+#
+# The live netdev is authoritative: the driver points
+# /sys/class/net/wlN/device at the PCI function, and that function's `device`
+# file is the chip id the driver matched. Detection needs the module loaded, so
+# a small board default covers the window before insmod runs.
 
-bcw_band_to_unit() {
+bcw_pciid_to_band() {
 	case "$1" in
-	2g|11b|11g|b|g) echo 0 ;;
-	5g|11a|a)       echo 1 ;;
-	*)              echo "" ;;
+	0x4331|0x4332)               echo 2g ;;   # BCM4331 2.4GHz 11n
+	0x4352|0x4360|0x43a0|0x43b1) echo 5g ;;   # BCM435x/4360/43a0 5GHz 11ac
+	*)                           echo "" ;;
+	esac
+}
+
+# Band carried by a live wlN netdev; empty if it is not a primary wl iface.
+bcw_iface_band() {
+	_d="/sys/class/net/$1/device"
+	[ -e "$_d/device" ] || return 0
+	bcw_pciid_to_band "$(cat "$_d/device" 2>/dev/null)"
+}
+
+# Resolve a UCI band to the wl<N> netdev that actually carries it.
+bcw_band_to_ifname() {
+	case "$1" in
+	2g|11b|11g|b|g) _want=2g ;;
+	5g|11a|a)       _want=5g ;;
+	*)              echo ""; return 0 ;;
+	esac
+	# 1. A live radio whose chip id matches wins.
+	for _if in $(bcw_all_wl_ifaces); do
+		[ "$(bcw_iface_band "$_if")" = "$_want" ] && { echo "$_if"; return 0; }
+	done
+	# 2. Module not up yet: fall back to the WZR-1750DHP probe order.
+	case "$_want" in
+	2g) echo wl1 ;;
+	5g) echo wl0 ;;
 	esac
 }
 
@@ -205,8 +234,16 @@ bcw_radio_apply() {
 	# shellcheck disable=SC1090
 	. "$_spec"
 
+	# UNIT is authoritative when the caller supplied it (the netifd handler
+	# resolves band -> wl<N> and puts it in the spec). Fall back to resolving
+	# here so a hand-written spec with only BAND still works.
 	_unit="$UNIT"
-	_ifname="$(bcw_unit_to_ifname "$_unit")"
+	if [ -z "$_unit" ]; then
+		_ifname="$(bcw_band_to_ifname "$BAND")"
+		_unit="${_ifname#wl}"
+	else
+		_ifname="$(bcw_unit_to_ifname "$_unit")"
+	fi
 
 	# Static per-radio identity. phytype=v (11AC) is what both radios report;
 	# nband is what wlconf uses to pick the band for an 11N/11AC phytype.
@@ -309,6 +346,11 @@ bcw_radio_up() {
 	_ifname="$(bcw_unit_to_ifname "$_unit")"
 	wlconf "$_ifname" up
 	wlconf "$_ifname" start
+	# WLC_UP brings the radio up but leaves the netdev administratively down.
+	# netifd's wireless glue only marks the netdev as a bridge master when the
+	# handler reports it via set_vif(); it does not set IFF_UP itself, so the
+	# port never joins br-lan and no traffic flows. Bring it up here.
+	ip link set "$_ifname" up
 }
 
 bcw_radio_down() {
@@ -401,6 +443,45 @@ bcw_seed_defaults() {
 }
 
 # ---------------------------------------------------------------------------
+# netifd handler: keep exactly one
+# ---------------------------------------------------------------------------
+#
+# netifd discovers wireless protocol handlers by globbing
+# /lib/netifd/wireless/*.sh and running each one to dump its capabilities.
+# Its reader loop does not stop at EOF (f.error() never leaves the null state),
+# so with more than one handler script present netifd busy-spins at ~100% CPU
+# and never finishes bringing up networking. Stock ships a single handler
+# (mac80211.sh); installing ours alongside it makes two and triggers the bug.
+#
+# There is no cfg80211/mac80211 driver on this board -- ours is the only
+# wireless handler that means anything here -- so move every handler except
+# broadcom.sh out of the scan path. This is reversible: the files are kept
+# beside the dir as <name>.sh.disabled and restored by the package prerm.
+
+BCW_WIRELESS_DIR="${BCW_WIRELESS_DIR:-/lib/netifd/wireless}"
+BCW_HANDLER_DISABLED_DIR="${BCW_HANDLER_DISABLED_DIR:-/lib/netifd}"
+
+bcw_single_handler() {
+	[ -d "$BCW_WIRELESS_DIR" ] || return 0
+	for _h in "$BCW_WIRELESS_DIR"/*.sh; do
+		[ -e "$_h" ] || continue
+		_b="$(basename "$_h")"
+		[ "$_b" = broadcom.sh ] && continue
+		mv -f "$_h" "$BCW_HANDLER_DISABLED_DIR/$_b.disabled" 2>/dev/null
+	done
+	return 0
+}
+
+bcw_restore_handler() {
+	for _h in "$BCW_HANDLER_DISABLED_DIR"/*.sh.disabled; do
+		[ -e "$_h" ] || continue
+		_b="$(basename "$_h")"; _b="${_b%.disabled}"
+		mv -f "$_h" "$BCW_WIRELESS_DIR/$_b" 2>/dev/null
+	done
+	return 0
+}
+
+# ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 
@@ -410,12 +491,15 @@ bcw_main() {
 	up)      bcw_radio_up "$2" ;;
 	down)    bcw_radio_down "$2" ;;
 	seed)    bcw_seed_defaults ;;
+	handler-single)  bcw_single_handler ;;
+	handler-restore) bcw_restore_handler ;;
 	security-start) shift; bcw_security_start "$@" ;;
 	security-stop)  bcw_security_stop ;;
+	ifname)  bcw_band_to_ifname "$2" ;;
 	nvset)   bcw_nvset "$2" "$3" ;;
 	nvget)   bcw_nvget "$2" ;;
 	*)
-		echo "usage: broadcom-wl-ctl {seed|apply <file>|up <unit>|down <unit>|security-start <if> <bridge>|security-stop|nvset <k> <v>|nvget <k>}" >&2
+		echo "usage: broadcom-wl-ctl {seed|handler-single|handler-restore|apply <file>|up <unit>|down <unit>|security-start <if> <bridge>|security-stop|ifname <band>|nvset <k> <v>|nvget <k>}" >&2
 		return 1
 		;;
 	esac

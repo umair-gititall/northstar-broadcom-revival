@@ -31,6 +31,13 @@ import { validate } from 'wifi.validate';
 import * as netifd from 'wifi.netifd';
 import * as fs from 'fs';
 
+// netifd's notify channel (wifi.netifd) targets `device: global.radio`, so the
+// radio section name has to be set here. mac80211.sh does the same. Without
+// this, every set_vif()/set_up()/setup_failed() notify arrives device-less and
+// is dropped, netifd never marks the device "up", and it tears the radio down
+// and re-sets-up until retry_setup_failed latches.
+global.radio = ARGV[2];
+
 const RUNDIR = '/var/run/broadcom-wl';
 const SCHEMA_DIR = '/usr/share/schema';
 
@@ -70,19 +77,16 @@ function shq(v) {
 	return "'" + replace('' + v, "'", "'\\''") + "'";
 }
 
-function band_to_unit(band) {
-	switch (band) {
-	case '5g':
-	case '11a':
-	case 'a':
-		return 1;
-	default:
-		return 0;
-	}
-}
-
-function unit_ifname(unit) {
-	return 'wl' + unit;
+// Resolve a UCI band to the wl<N> netdev that actually carries it. The mapping
+// is not fixed: the driver numbers the radios in PCI probe order, and on the
+// WZR-1750DHP the 5GHz radio enumerates first (wl0 = 5GHz, wl1 = 2.4GHz).
+// common.sh owns the detection (it reads the chip id from sysfs); ask it rather
+// than guessing here, so LuCI's band -> radio mapping stays correct.
+function resolve_ifname(band) {
+	let f = `${RUNDIR}/.ifname`;
+	system(`/usr/sbin/broadcom-wl-ctl ifname ${band} > ${f} 2>/dev/null`);
+	let s = fs.readfile(f);
+	return s ? split(s, '\n')[0] : '';
 }
 
 // The bridge a wireless iface is attached to. netifd names bridges br-<network>
@@ -167,8 +171,13 @@ function setup() {
 
 	validate('device', config);
 
-	let unit = band_to_unit(band);
-	let ifname = unit_ifname(unit);
+	let ifname = resolve_ifname(band);
+	if (ifname == '') {
+		log(`${radio}: no ${band} radio found (is the wl module loaded?)`);
+		netifd.setup_failed(`${radio}: no ${band} radio`);
+		return 1;
+	}
+	let unit = substr(ifname, 2);
 
 	// Collect the AP interfaces and normalise them the same way mac80211 does.
 	let ap_ifaces = 0;
@@ -231,10 +240,11 @@ function teardown() {
 	let data = json(ARGV[3]);
 	let config = data.config ?? {};
 	let band = config.band ?? '2g';
-	let unit = band_to_unit(band);
+	let ifname = resolve_ifname(band);
 
 	run('/usr/sbin/broadcom-wl-ctl security-stop');
-	run(`/usr/sbin/broadcom-wl-ctl down ${unit}`);
+	if (ifname != '')
+		run(`/usr/sbin/broadcom-wl-ctl down ${substr(ifname, 2)}`);
 
 	return 0;
 }
