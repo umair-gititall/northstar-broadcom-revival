@@ -25,7 +25,19 @@
 /userspace/uclibc-compat/uclibc.so
 /userspace/uclibc-compat/wl
 
-# ...except the blobs themselves, which ARE the package: the driver, and
-# FreshTomato's prebuilt `wl` tool (they ship no source for it).
-!/vendor/wl/linux/wl_apsta.o
-!/vendor/wl/arm-uclibc/wl
+# Vendored-library build outputs (their sources are tracked).
+/vendor/libnvram/libnvram.so
+/vendor/libshared/libshared.so
+
+# Release artifacts.
+/dist/
+
+# The proprietary blobs are NOT tracked: Broadcom's driver object and the
+# prebuilt `wl` tool ship no source, and this repo does not redistribute them.
+# fetch.sh retrieves them from the vendor's published source at a pinned,
+# hash-verified revision; see vendor/README.md. (wl_apsta.o would be caught by
+# the *.o rule above anyway - it is listed for the reader, and so that a future
+# rule cannot silently re-include it.)
+/vendor/wl/linux/wl_apsta.o
+/vendor/wl/up/wl_apsta.o
+/vendor/wl/arm-uclibc/wl
