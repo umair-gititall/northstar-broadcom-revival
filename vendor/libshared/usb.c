@@ -1,0 +1,504 @@
+/*
+ *
+ * Tomato Firmware
+ * USB Support Module
+ *
+ * Fixes/updates (C) 2018 - 2026 pedro
+ * https://freshtomato.org/
+ *
+ */
+
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/types.h>
+#include <dirent.h>
+#include <ctype.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <limits.h>
+
+#include "shutils.h"
+#include "shared.h"
+
+
+/* Execute a function for each disc partition on the specified controller.
+ *
+ * Directory /dev/discs/ looks like this:
+ * disc0 -> ../scsi/host0/bus0/target0/lun0/
+ * disc1 -> ../scsi/host1/bus0/target0/lun0/
+ * disc2 -> ../scsi/host2/bus0/target0/lun0/
+ * disc3 -> ../scsi/host2/bus0/target0/lun1/
+ *
+ * Scsi host 2 supports multiple drives.
+ * Scsi host 0 & 1 support one drive.
+ *
+ * For attached drives, like this.  If not attached, there is no "part#" item.
+ * Here, only one drive, with 2 partitions, is plugged in.
+ * /dev/discs/disc0/disc
+ * /dev/discs/disc0/part1
+ * /dev/discs/disc0/part2
+ * /dev/discs/disc1/disc
+ * /dev/discs/disc2/disc
+ *
+ * Which is the same as:
+ * /dev/scsi/host0/bus0/target0/lun0/disc
+ * /dev/scsi/host0/bus0/target0/lun0/part1
+ * /dev/scsi/host0/bus0/target0/lun0/part2
+ * /dev/scsi/host1/bus0/target0/lun0/disc
+ * /dev/scsi/host2/bus0/target0/lun0/disc
+ * /dev/scsi/host2/bus0/target0/lun1/disc
+ *
+ * Implementation notes:
+ * Various mucking about with a disc that just got plugged in or unplugged
+ * will make the scsi subsystem try a re-validate, and read the partition table of the disc.
+ * This will make sure the partitions show up.
+ *
+ * It appears to try to do the revalidate and re-read & update the partition
+ * information when this code does the "readdir of /dev/discs/disc0/?".  If the
+ * disc has any mounted partitions the revalidate will be rejected.  So the
+ * current partition info will remain.  On an unplug event, when it is doing the
+ * readdir's, it will try to do the revalidate as we are doing the readdir's.
+ * But luckily they'll be rejected, otherwise the later partitions will disappear as
+ * soon as we get the first one.
+ * But be very careful!  If something goes not exactly right, the partition entries
+ * will disappear before we've had a chance to unmount from them.
+ *
+ * To avoid this automatic revalidation, we go through /proc/partitions looking for the partitions
+ * that /dev/discs point to.  That will avoid the implicit revalidate attempt.
+ * 
+ * If host < 0, do all hosts.   If >= 0, it is the host number to do.
+ *
+ */
+
+/* check if the block device has no partition */
+int is_no_partition(const char *discname)
+{
+	FILE *procpt;
+	char line[128], ptname[32];
+	int ma, mi, sz;
+	int count = 0;
+
+	if ((procpt = fopen("/proc/partitions", "r"))) {
+		while (fgets(line, sizeof(line), procpt)) {
+			if (sscanf(line, " %d %d %d %[^\n ]", &ma, &mi, &sz, ptname) != 4)
+				continue;
+
+			if (strstr(ptname, discname))
+				count++;
+		}
+	}
+
+	return (count == 1);
+}
+
+#ifdef TOMATO64
+int exec_for_host(int host, int obsolete, uint flags, host_exec func)
+{
+	DIR *usb_dev_disc;
+	char ptname[32];/* Will be: discDN_PN	 					*/
+	char dsname[16];/* Will be: discDN	 					*/
+	int host_no;	/* SCSI controller/host # */
+	struct dirent *dp;
+	FILE *prt_fp;
+	int siz;
+	char line[256];
+	int result = 0;
+	int len;
+	int ret;
+	char hostbuf[16], device_path[PATH_MAX], linkbuf[PATH_MAX], *h;
+
+	_dprintf("exec_for_host(%d, %d, %d, %p)\n", host, obsolete, flags, func);
+	if (!func)
+		return 0;
+
+	flags |= EFH_1ST_HOST;
+
+	/* /sys/bus/scsi/devices/X:X:X:X/block:sdX doesn't exist in kernel 3.0
+	 * 1. Enumerate sub-directory, DIR, of /sys/block.
+	 * 2. Skip ., .., loop*, mtdblock*, ram*, etc.
+	 * 3. read DIR/device link. Check whether X:X:X:X exist. e.g.
+	 *    56U: ../../devices/platform/rt3xxx-ehci/usb1/1-1/1-1:1.0/host1/target1:0:0/1:0:0:0
+	 *    65U: ../../devices/pci0000:00/0000:00:00.0/0000:01:00.0/usb1/1-2/1-2:1.0/host1/target1:0:0/1:0:0:0
+	 * 4. If yes, DIR would be sda, sdb, etc.
+	 * 5. Search DIR in /proc/partitions.
+	 */
+	snprintf(hostbuf, sizeof(hostbuf), "%d:", host);
+	if (!(usb_dev_disc = opendir("/sys/block")))
+		return 0;
+	while ((dp = readdir(usb_dev_disc))) {
+		if (!strncmp(dp->d_name, "loop", 4) ||
+		    !strncmp(dp->d_name, "mtdblock", 8) ||
+		    !strncmp(dp->d_name, "ram", 3) ||
+		    !strcmp(dp->d_name, ".") ||
+		    !strcmp(dp->d_name, "..")
+		   )
+			continue;
+
+		snprintf(device_path, sizeof(device_path), "/sys/block/%s", dp->d_name);
+		len = readlink(device_path, linkbuf, sizeof(linkbuf) - 1);
+		if (len == -1) {
+			snprintf(device_path, sizeof(device_path), "/sys/block/%s/device", dp->d_name);
+			len = readlink(device_path, linkbuf, sizeof(linkbuf) - 1);
+			if (len == -1)
+				continue;
+		}
+		linkbuf[len] = '\0';
+
+		h = strstr(linkbuf, "/host");
+		if (!h)	continue;
+		if ((ret = sscanf(h, "/host%*d/target%*d:%*d:%*d/%d:%*d:%*d:%*d", &host_no)) != 1) {
+			_dprintf("%s(): sscanf can't distinguish host_no from [%s]. ret %d\n", __func__, linkbuf, ret);
+			continue;
+		}
+		if (host >= 0 && host != host_no)
+			continue;
+		snprintf(dsname, sizeof(dsname), dp->d_name);
+		siz = strlen(dsname);
+		flags |= EFH_1ST_DISC;
+		if (!(prt_fp = fopen("/proc/partitions", "r")))
+			continue;
+		while (fgets(line, sizeof(line) - 2, prt_fp)) {
+			if (sscanf(line, " %*s %*s %*s %s", ptname) != 1)
+				continue;
+
+			if (!strncmp(ptname, dsname, siz)) {
+				if (!strcmp(ptname, dsname) && !is_no_partition(dsname))
+					continue;
+				snprintf(line, sizeof(line), "/dev/%s", ptname);
+				result = (*func)(line, host_no, dsname, ptname, flags) || result;
+				flags &= ~(EFH_1ST_HOST | EFH_1ST_DISC);
+			}
+		}
+		fclose(prt_fp);
+	}
+	closedir(usb_dev_disc);
+
+	return result;
+}
+
+#else
+
+int exec_for_host(int host, int obsolete, uint flags, host_exec func)
+{
+	DIR *usb_dev_disc;
+	DIR *dir_host;
+	char bfr[256];		/* Will be: /dev/discs/disc# */
+	char ptname[32];	/* Will be: discDN_PN */
+	char dsname[16];	/* Will be: discDN */
+	int host_no;		/* SCSI controller/host */
+	int bus, target, lun;
+	struct dirent *dp;
+	FILE *prt_fp;
+	size_t siz;
+	char line[256];
+	char hostbuf[16];
+	int result = 0;
+
+	flags |= EFH_1ST_HOST;
+
+	/*
+	 * Scsi block devices in kernel 2.6 (for attached devices) can be found as
+	 * /sys/bus/scsi/devices/<host_no>:x:x:x/block:[sda|sdb|...]
+	 */
+	if ((usb_dev_disc = opendir("/sys/bus/scsi/devices"))) {
+		snprintf(hostbuf, sizeof(hostbuf), "%d:", host);
+
+		while ((dp = readdir(usb_dev_disc))) {
+			if (host >= 0 && strncmp(dp->d_name, hostbuf, strlen(hostbuf)) != 0)
+				continue;
+
+			if (sscanf(dp->d_name, "%d:%d:%d:%d", &host_no, &bus, &target, &lun) != 4)
+				continue;
+
+			snprintf(bfr, sizeof(bfr), "/sys/bus/scsi/devices/%d:%d:%d:%d", host_no, bus, target, lun);
+			if ((dir_host = opendir(bfr))) {
+				while ((dp = readdir(dir_host))) {
+					if (strncmp(dp->d_name, "block:", 6) != 0)
+						continue;
+
+					siz = strlcpy(dsname, dp->d_name + 6, sizeof(dsname));
+					if (siz >= sizeof(dsname))
+						continue;
+
+					flags |= EFH_1ST_DISC;
+					if (func && (prt_fp = fopen("/proc/partitions", "r"))) {
+						while (fgets(line, sizeof(line), prt_fp)) {
+							if (sscanf(line, " %*s %*s %*s %31s", ptname) == 1) {
+								if (strncmp(ptname, dsname, siz) == 0 && (ptname[siz] == '\0' || isdigit((unsigned char)ptname[siz]))) {
+									if ((strcmp(ptname, dsname) == 0) && !is_no_partition(dsname))
+										continue;
+
+									snprintf(line, sizeof(line), "/dev/%s", ptname);
+									result = (*func)(line, host_no, dsname, ptname, flags) || result;
+									flags &= ~(EFH_1ST_HOST | EFH_1ST_DISC);
+								}
+							}
+						}
+						fclose(prt_fp);
+					}
+				}
+				closedir(dir_host);
+			}
+		}
+		closedir(usb_dev_disc);
+	}
+
+	return result;
+}
+#endif /* TOMATO64 */
+
+/* Concept taken from the e2fsprogs/ismounted.c.
+ * Find wherever 'file' (actually: device) is mounted.
+ * Either the exact same device-name, or another device-name.
+ * The latter is detected by comparing the rdev or dev&inode.
+ * So aliasing won't fool us---we'll still find if it's mounted.
+ * Return its mnt entry.
+ * In particular, the caller would look at the mnt->mountpoint.
+ *
+ * Find the matching devname(s) in mounts or swaps.
+ * If func is supplied, call it for each match.  If not, return mnt on the first match.
+ */
+static inline int is_same_device(char *fsname, dev_t file_rdev, dev_t file_dev, ino_t file_ino)
+{
+	struct stat st_buf;
+
+	if (stat(fsname, &st_buf) == 0) {
+		if (S_ISBLK(st_buf.st_mode)) {
+			if (file_rdev && (file_rdev == st_buf.st_rdev))
+				return 1;
+		}
+		else {
+			if (file_dev && ((file_dev == st_buf.st_dev) &&
+				(file_ino == st_buf.st_ino)))
+				return 1;
+
+			/* Check for [swap]file being on the device. */
+			if (file_dev == 0 && file_ino == 0 && file_rdev == st_buf.st_dev)
+				return 1;
+		}
+	}
+	return 0;
+}
+
+struct mntent *findmntents(char *file, int swp, int (*func)(struct mntent *mnt, uint flags), uint flags)
+{
+	struct mntent	*mnt;
+	struct stat	st_buf;
+	dev_t		file_dev=0, file_rdev=0;
+	ino_t		file_ino=0;
+	FILE		*f;
+
+	if ((f = setmntent(swp ? "/proc/swaps": "/proc/mounts", "r")) == NULL)
+		return NULL;
+
+	if (stat(file, &st_buf) == 0) {
+		if (S_ISBLK(st_buf.st_mode)) {
+			file_rdev = st_buf.st_rdev;
+		}
+		else {
+			file_dev = st_buf.st_dev;
+			file_ino = st_buf.st_ino;
+		}
+	}
+	while ((mnt = getmntent(f)) != NULL) {
+		/* Always ignore rootfs mount */
+		if (strcmp(mnt->mnt_fsname, "rootfs") == 0)
+			continue;
+
+		if (strcmp(file, mnt->mnt_fsname) == 0 || strcmp(file, mnt->mnt_dir) == 0 || is_same_device(mnt->mnt_fsname, file_rdev , file_dev, file_ino)) {
+			if (func == NULL)
+				break;
+
+			(*func)(mnt, flags);
+		}
+	}
+
+	endmntent(f);
+	return mnt;
+}
+
+/* Simulate a hotplug event, as if a USB storage device
+ * got plugged or unplugged.
+ */
+void add_remove_usbhost(char *host, int add)
+{
+	setenv("ACTION", add ? "add" : "remove", 1);
+	setenv("SCSI_HOST", host, 1);
+	setenv("PRODUCT", host, 1);
+	setenv("INTERFACE", "TOMATO/0", 1);
+
+	/* don't use value from /proc/sys/kernel/hotplug 
+	 * since it may be overriden by a user
+	 */
+	eval("hotplug", "usb");
+
+	unsetenv("INTERFACE");
+	unsetenv("PRODUCT");
+	unsetenv("SCSI_HOST");
+	unsetenv("ACTION");
+}
+
+/****************************************************/
+/* Use busybox routines to get labels for fat & ext */
+/* Probe for label the same way that mount does.    */
+/****************************************************/
+
+#define VOLUME_ID_LABEL_SIZE		64
+#define VOLUME_ID_UUID_SIZE		36
+#define SB_BUFFER_SIZE			0x11000
+
+struct volume_id
+{
+	int		fd;
+	unsigned	known_size;
+	size_t		sbbuf_len;
+	size_t		seekbuf_len;
+	uint8_t		*sbbuf;
+	uint8_t		*seekbuf;
+	uint64_t	seekbuf_off;
+	char		label[VOLUME_ID_LABEL_SIZE+1];
+	char		uuid[VOLUME_ID_UUID_SIZE+1];
+};
+
+extern void *volume_id_get_buffer();
+extern void volume_id_free_buffer();
+extern int volume_id_probe_ext();
+extern int volume_id_probe_vfat();
+extern int volume_id_probe_ntfs();
+#ifdef TCONFIG_BCMARM
+ #ifdef HFS
+ extern int volume_id_probe_hfs_hfsplus();
+ #endif
+extern int volume_id_probe_exfat();
+#endif /* TCONFIG_BCMARM */
+#ifdef TOMATO64
+extern int volume_id_probe_btrfs();
+#endif /* TOMATO64 */
+extern int volume_id_probe_linux_swap();
+
+/* magic for ext2/3/4 detection */
+int check_magic(const unsigned char *buf, const char *magic)
+{
+	unsigned char compat = buf[0];
+	unsigned char incompat = buf[4];
+	unsigned char ro_compat = buf[8];
+
+	if (!strncmp(magic, "ext3_chk", 8)) {
+		if (!(compat & 4))
+			return 0;
+		if (incompat >= 0x40)
+			return 0;
+		if (ro_compat >= 8)
+			return 0;
+		return 1;
+	}
+
+	if (!strncmp(magic, "ext4_chk", 8)) {
+		if (!(compat & 4))
+			return 0;
+		if (incompat >= 0x40)
+			return 1;
+		if (ro_compat > 7)
+			return 1;
+		return 0;
+	}
+
+	return 0;
+}
+
+/* Put the label in *label and uuid in *uuid.
+ * Return fstype if determined.
+ */
+char *find_label_or_uuid(char *dev_name, char *label, size_t label_sz, char *uuid, size_t uuid_sz)
+{
+	struct volume_id id;
+	char *fstype = NULL;
+	const unsigned char *ext_flags = NULL;
+
+	memset(&id, 0x00, sizeof(id));
+	id.known_size = UINT_MAX;
+	if (label) *label = 0;
+	if (uuid) *uuid = 0;
+	if ((id.fd = open(dev_name, O_RDONLY)) < 0)
+		return NULL;
+
+	volume_id_get_buffer(&id, 0, SB_BUFFER_SIZE);
+
+	/* detect swap */
+	if (id.known_size == UINT_MAX && volume_id_probe_linux_swap(&id) == 0)
+		fstype = "swap";
+	/* detect vfat */
+	else if (id.known_size == UINT_MAX && volume_id_probe_vfat(&id) == 0)
+		fstype = "vfat";
+	/* detect ext2/3/4 */
+	else if (id.known_size == UINT_MAX && volume_id_probe_ext(&id) == 0) {
+		if (id.sbbuf[0x438] == 0x53 && id.sbbuf[0x439] == 0xEF) {
+			ext_flags = &id.sbbuf[0x45c];
+
+			if (check_magic(ext_flags, "ext3_chk"))
+				fstype = "ext3";
+			else if (check_magic(ext_flags, "ext4_chk"))
+				fstype = "ext4";
+			else
+				fstype = "ext2";
+		}
+	}
+	/* detect ntfs */
+	else if (id.known_size == UINT_MAX && volume_id_probe_ntfs(&id) == 0)
+		fstype = "ntfs";
+#ifdef TCONFIG_BCMARM
+ #ifdef HFS
+	/* detect hfs */
+	else if (id.known_size == UINT_MAX && volume_id_probe_hfs_hfsplus(&id) == 0) {
+		if ((!memcmp(id.sbbuf + 1032, "HFSJ", 4)) || (!memcmp(id.sbbuf + 1032, "H+", 2)) ||
+		    (!memcmp(id.sbbuf + 1024, "H+", 2)) || (!memcmp(id.sbbuf + 1024, "HX", 2))) {
+			if (id.sbbuf[1025] == 0x58)
+				fstype = "hfsplus"; /* hfs+jx */
+			else
+				fstype = "hfsplus"; /* hfs+j */
+		}
+		else
+			fstype = "hfs";
+	}
+ #endif
+	/* detect exfat */
+	else if (id.known_size == UINT_MAX && volume_id_probe_exfat(&id) == 0)
+		fstype = "exfat";
+#endif /* TCONFIG_BCMARM */
+#ifdef TOMATO64
+	else if (id.known_size == UINT_MAX && volume_id_probe_btrfs(&id) == 0)
+		fstype = "btrfs";
+#endif /* TOMATO64 */
+	/* -> unknown FS */
+	else if (id.known_size == UINT_MAX)
+		fstype = "unknown";
+
+	volume_id_free_buffer(&id);
+
+	if (label && (*id.label != 0))
+		strlcpy(label, id.label, label_sz);
+
+	if (uuid && (*id.uuid != 0))
+		strlcpy(uuid, id.uuid, uuid_sz);
+
+	close(id.fd);
+
+	return (fstype);
+}
+
+void *xmalloc(size_t siz)
+{
+	return (malloc(siz));
+}
+
+void *xrealloc(void *old, size_t size)
+{
+	return realloc(old, size);
+}
+
+ssize_t full_read(int fd, void *buf, size_t len)
+{
+	return read(fd, buf, len);
+}

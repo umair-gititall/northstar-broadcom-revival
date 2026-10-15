@@ -21,26 +21,15 @@ ifeq ($(origin AR),default)
 AR := $(CROSS_COMPILE)ar
 endif
 
-# Under Buildroot, CPPFLAGS/LDFLAGS already point at the sysroot. Standing in
-# for them out of tree matters for one header in particular: libshared's
-# shared.h includes tomato_config.h, which does not exist in the source tree at
-# all - libshared generates it and installs it to staging - so a build without
-# this fails immediately and confusingly.
-BCM_SYSROOT ?= $(T64_OUT)/host/arm-tomato64-linux-musleabi/sysroot
-ifeq ($(origin CPPFLAGS),undefined)
-CPPFLAGS := -I$(BCM_SYSROOT)/usr/include
-endif
-ifeq ($(origin LDFLAGS),undefined)
-LDFLAGS := -L$(BCM_SYSROOT)/usr/lib
-endif
-
-# The one thing this repo needs from tomato64. libshared installs only
-# libshared.so and tomato_config.h into staging, so its headers - shared.h,
-# shutils.h, wlutils.h, wlif_utils.h and the Broadcom trees beside them - can
-# only be reached in its source directory. Buildroot's package passes
-# BR2_EXTERNAL_TOMATO64_PATH down for exactly this.
-LIBSHARED := $(BR2_EXTERNAL_TOMATO64_PATH)/package/libshared/shared
+# Vendored dependencies (Mission 3.3). libshared supplies the userspace
+# headers - shared.h, shutils.h, wlutils.h, wlif_utils.h, wlioctl.h and the
+# Broadcom trees beside them - plus the generated tomato_config.h; libnvram
+# supplies nvram_get()/nvram_set(). Both are built from source by their own
+# Makefiles in vendor/, so a standalone musl build needs nothing from a
+# Tomato64 Buildroot output tree.
 VENDOR    := $(CURDIR)/../../vendor
+LIBSHARED := $(VENDOR)/libshared
+LIBNVRAM  := $(VENDOR)/libnvram
 USERSPACE := $(CURDIR)/..
 
 # -std=gnu11, not the compiler default: GCC 15 defaults to C23, where `bool` is
@@ -70,5 +59,9 @@ BCM_CFLAGS  = -O2 -Wall
 BCM_CFLAGS += -no-pie
 BCM_CFLAGS += $(CFLAGS)
 
+# The vendored libraries first, so the tools' `-lnvram -lshared` resolve even
+# when LDFLAGS already carries a Buildroot staging -L. Recursively expanded
+# (LIBNVRAM/LIBSHARED are defined above), so order here does not matter.
 BCM_LDFLAGS  = -no-pie
+BCM_LDFLAGS += -L$(LIBNVRAM) -L$(LIBSHARED)
 BCM_LDFLAGS += $(LDFLAGS)

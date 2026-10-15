@@ -1,0 +1,1474 @@
+/*
+ *
+ * Tomato Firmware
+ * Copyright (C) 2006-2009 Jonathan Zarate
+ *
+ * Fixes/updates (C) 2018 - 2026 pedro
+ * https://freshtomato.org/
+ *
+ */
+
+
+#include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/stat.h>
+#include <stdarg.h>
+#include <syslog.h>
+#include <sys/ioctl.h>
+#include <net/if.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <arpa/inet.h>
+#include <ifaddrs.h>
+#include <sys/sysinfo.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+
+#include <bcmnvram.h>
+#include <bcmdevs.h>
+#include <wlutils.h>
+
+#include "shutils.h"
+#include "shared.h"
+
+/* needed by logmsg() */
+#define LOGMSG_DISABLE	DISABLE_SYSLOG_OS
+#define LOGMSG_NVDEBUG	"misc_debug"
+
+
+/*
+ * Formats the numeric suffix used by the lan/lanN bridge namespace.
+ *
+ * @param bridge       bridge index; bridge 0 maps to an empty suffix
+ * @param suffix       destination buffer
+ * @param suffix_size  size of the destination buffer
+ */
+void get_bridge_suffix(unsigned int bridge, char *suffix, const size_t suffix_size)
+{
+	if (bridge == 0)
+		suffix[0] = '\0';
+	else
+		snprintf(suffix, suffix_size, "%u", bridge);
+}
+
+/*
+ * Builds an NVRAM key from an existing namespace prefix and variable suffix.
+ *
+ * @param prefix    existing namespace prefix, for example "wan2" or "pptpc"
+ * @param suffix    NVRAM variable suffix without the separating underscore
+ * @param key       destination buffer receiving the complete NVRAM key
+ * @param key_size  size of the key buffer
+ */
+static void get_prefix_nvram_key(const char *prefix, const char *suffix, char *key, const size_t key_size)
+{
+	snprintf(key, key_size, "%s_%s", prefix, suffix);
+}
+
+/*
+ * Reads an NVRAM value from an existing namespace prefix.
+ *
+ * @param prefix    existing namespace prefix
+ * @param suffix    NVRAM variable suffix without the separating underscore
+ * @param key       scratch buffer receiving the complete NVRAM key
+ * @param key_size  size of the key buffer
+ * @return          value returned by nvram_safe_get(); never NULL
+ */
+char *prefix_nvram_get(const char *prefix, const char *suffix, char *key, const size_t key_size)
+{
+	get_prefix_nvram_key(prefix, suffix, key, key_size);
+	return nvram_safe_get(key);
+}
+
+/*
+ * Sets an NVRAM value in an existing namespace prefix.
+ *
+ * @param prefix    existing namespace prefix
+ * @param suffix    NVRAM variable suffix without the separating underscore
+ * @param value     value passed to nvram_set()
+ * @param key       scratch buffer receiving the complete NVRAM key
+ * @param key_size  size of the key buffer
+ */
+void prefix_nvram_set(const char *prefix, const char *suffix, const char *value, char *key, const size_t key_size)
+{
+	get_prefix_nvram_key(prefix, suffix, key, key_size);
+	nvram_set(key, value);
+}
+
+/*
+ * Removes an NVRAM value from an existing namespace prefix.
+ *
+ * @param prefix    existing namespace prefix
+ * @param suffix    NVRAM variable suffix without the separating underscore
+ * @param key       scratch buffer receiving the complete NVRAM key
+ * @param key_size  size of the key buffer
+ */
+void prefix_nvram_unset(const char *prefix, const char *suffix, char *key, const size_t key_size)
+{
+	get_prefix_nvram_key(prefix, suffix, key, key_size);
+	nvram_unset(key);
+}
+
+/*
+ * Compares an NVRAM value in an existing namespace prefix.
+ *
+ * @param prefix    existing namespace prefix
+ * @param suffix    NVRAM variable suffix without the separating underscore
+ * @param value     comparison value passed to nvram_match()
+ * @param key       scratch buffer receiving the complete NVRAM key
+ * @param key_size  size of the key buffer
+ * @return          result returned by nvram_match()
+ */
+int prefix_nvram_match(const char *prefix, const char *suffix, const char *value, char *key, const size_t key_size)
+{
+	get_prefix_nvram_key(prefix, suffix, key, key_size);
+	return nvram_match(key, value);
+}
+
+/*
+ * Reads an integer NVRAM value from an existing namespace prefix.
+ *
+ * @param prefix    existing namespace prefix
+ * @param suffix    NVRAM variable suffix without the separating underscore
+ * @param key       scratch buffer receiving the complete NVRAM key
+ * @param key_size  size of the key buffer
+ * @return          integer value returned by nvram_get_int()
+ */
+int prefix_nvram_get_int(const char *prefix, const char *suffix, char *key, const size_t key_size)
+{
+	get_prefix_nvram_key(prefix, suffix, key, key_size);
+	return nvram_get_int(key);
+}
+
+/*
+ * Formats the bridge NVRAM namespace prefix.
+ *
+ * @param bridge       bridge index; bridge 0 maps to "lan"
+ * @param prefix       destination buffer
+ * @param prefix_size  size of the destination buffer
+ */
+void get_bridge_prefix(unsigned int bridge, char *prefix, const size_t prefix_size)
+{
+	if (bridge == 0)
+		strlcpy(prefix, "lan", prefix_size);
+	else
+		snprintf(prefix, prefix_size, "lan%u", bridge);
+}
+
+/*
+ * Builds a bridge-scoped NVRAM key using the lan/lanN naming convention.
+ *
+ * @param bridge    bridge index; bridge 0 uses the unsuffixed lan namespace
+ * @param suffix    NVRAM variable suffix without the separating underscore
+ * @param key       destination buffer receiving the complete NVRAM key
+ * @param key_size  size of the key buffer
+ */
+void get_bridge_nvram_key(unsigned int bridge, const char *suffix, char *key, const size_t key_size)
+{
+	char prefix[12];
+
+	get_bridge_prefix(bridge, prefix, sizeof(prefix));
+	get_prefix_nvram_key(prefix, suffix, key, key_size);
+}
+
+/*
+ * Reads a bridge-scoped NVRAM value using the lan/lanN naming convention.
+ *
+ * @param bridge    bridge index; bridge 0 uses the unsuffixed lan namespace
+ * @param suffix    NVRAM variable suffix without the separating underscore
+ * @param key       scratch buffer receiving the complete NVRAM key
+ * @param key_size  size of the key buffer
+ * @return          value returned by nvram_safe_get(); never NULL
+ */
+char *bridge_nvram_get(unsigned int bridge, const char *suffix, char *key, const size_t key_size)
+{
+	get_bridge_nvram_key(bridge, suffix, key, key_size);
+	return nvram_safe_get(key);
+}
+
+/*
+ * Formats the NVRAM namespace prefix for a WAN unit.
+ *
+ * @param iWan_unit  WAN unit number; 1 maps to "wan", 2..MWAN_MAX to "wanN"
+ * @param sPrefix    destination buffer; must be large enough for "wanN"
+ */
+void get_wan_prefix(int iWan_unit, char *sPrefix)
+{
+	if ((iWan_unit > 1) && (iWan_unit <= MWAN_MAX))
+		sprintf(sPrefix, "wan%d", iWan_unit);
+	else
+		strcpy(sPrefix, "wan");
+}
+
+/*
+ * Builds a WAN-scoped NVRAM key.
+ *
+ * @param wan_unit  WAN unit number
+ * @param suffix    NVRAM variable suffix without the separating underscore
+ * @param key       destination buffer receiving the complete NVRAM key
+ * @param key_size  size of the key buffer
+ */
+static void get_wan_nvram_key(int wan_unit, const char *suffix, char *key, const size_t key_size)
+{
+	char prefix[8];
+
+	get_wan_prefix(wan_unit, prefix);
+	get_prefix_nvram_key(prefix, suffix, key, key_size);
+}
+
+/*
+ * Reads a WAN-scoped NVRAM value using the wan/wanN naming convention.
+ *
+ * @param wan_unit  WAN unit number
+ * @param suffix    NVRAM variable suffix without the separating underscore
+ * @param key       scratch buffer receiving the complete NVRAM key
+ * @param key_size  size of the key buffer
+ * @return          value returned by nvram_safe_get(); never NULL
+ */
+char *wan_nvram_get(int wan_unit, const char *suffix, char *key, const size_t key_size)
+{
+	get_wan_nvram_key(wan_unit, suffix, key, key_size);
+	return nvram_safe_get(key);
+}
+
+int get_wan_unit(const char *sPrefix)
+{
+	char wanstr[8];
+	unsigned int i, ret = 1;
+
+	for (i = 1; i <= MWAN_MAX; i++) {
+		get_wan_prefix(i, wanstr);
+
+		if (!strcmp(sPrefix, wanstr)) {
+			ret = i;
+			break;
+		}
+	}
+
+	return ret;
+}
+
+int get_wan_unit_with_value(const char *suffix, const char *value)
+{
+	char tmp[64];
+	int mwan_num, wan_unit;
+
+	mwan_num = nvram_get_int("mwan_num");
+	if ((mwan_num < 1) || (mwan_num > MWAN_MAX))
+		mwan_num = 1;
+
+	for (wan_unit = 1; wan_unit <= mwan_num; ++wan_unit) {
+		get_wan_prefix(wan_unit, tmp);
+		strlcat(tmp, suffix, sizeof(tmp));
+
+		if (nvram_match(tmp, value))
+			return wan_unit;
+	}
+
+	return -1;
+}
+
+int get_wan_proto(void)
+{
+	return get_wanx_proto("wan");
+}
+
+int get_wanx_proto(char *prefix)
+{
+	char tmp[16];
+	const char *names[] = {	/* order must be synced with def at shared.h */
+		"static",
+		"dhcp",
+		"l2tp",
+		"pppoe",
+		"pptp",
+		"ppp3g",
+		"lte",
+		NULL
+	};
+	int i;
+	const char *p;
+
+	p = prefix_nvram_get(prefix, "proto", tmp, sizeof(tmp));
+	for (i = 0; names[i] != NULL; ++i) {
+		if (strcmp(p, names[i]) == 0)
+			return i + 1;
+	}
+
+	return WP_DISABLED;
+}
+
+#ifdef TCONFIG_IPV6
+int get_ipv6_service(void)
+{
+	const char *names[] = {	/* order must be synced with def at shared.h */
+		"native",	/* IPV6_NATIVE */
+		"native-pd",	/* IPV6_NATIVE_DHCP */
+		"6to4",		/* IPV6_ANYCAST_6TO4 */
+		"sit",		/* IPV6_6IN4 */
+		"other",	/* IPV6_MANUAL */
+		"6rd",		/* IPV6_6RD */
+		"6rd-pd",	/* IPV6_6RD_DHCP */
+		NULL
+	};
+	int i;
+	const char *p;
+
+	p = nvram_safe_get("ipv6_service");
+	for (i = 0; names[i] != NULL; ++i) {
+		if (strcmp(p, names[i]) == 0)
+			return i + 1;
+	}
+
+	return IPV6_DISABLED;
+}
+
+const char *ipv6_router_address(struct in6_addr *in6addr)
+{
+	char *p;
+	struct in6_addr addr;
+	static char addr6[INET6_ADDRSTRLEN];
+
+	addr6[0] = '\0';
+
+	if ((p = nvram_get("ipv6_rtr_addr")) && *p) {
+		inet_pton(AF_INET6, p, &addr);
+	}
+	else if ((p = nvram_get("ipv6_prefix")) && *p) {
+		inet_pton(AF_INET6, p, &addr);
+		addr.s6_addr16[7] = htons(0x0001);
+	}
+	else {
+		return addr6;
+	}
+
+	inet_ntop(AF_INET6, &addr, addr6, sizeof(addr6));
+	if (in6addr)
+		memcpy(in6addr, &addr, sizeof(addr));
+
+	return addr6;
+}
+
+/* trim useless 0 from IPv6 address */
+const char *ipv6_address(const char *ipaddr6)
+{
+	struct in6_addr addr;
+	static char addr6[INET6_ADDRSTRLEN];
+
+	addr6[0] = '\0';
+
+	if (inet_pton(AF_INET6, ipaddr6, &addr) > 0)
+		inet_ntop(AF_INET6, &addr, addr6, sizeof(addr6));
+
+	return addr6;
+}
+
+/* extract prefix from configured IPv6 address */
+const char *ipv6_prefix(struct in6_addr *in6addr)
+{
+	static char prefix[INET6_ADDRSTRLEN];
+	struct in6_addr addr;
+	int i, r;
+
+	prefix[0] = '\0';
+	memset(&addr, 0, sizeof(addr));
+
+	if (inet_pton(AF_INET6, nvram_safe_get("ipv6_rtr_addr"), &addr) > 0) {
+		r = nvram_get_int("ipv6_prefix_length") ? : 64;
+		for (r = 128 - r, i = 15; r > 0; r -= 8) {
+			if (r >= 8) {
+				addr.s6_addr[i--] = 0;
+			}
+			else {
+				addr.s6_addr[i--] &= (0xff << r);
+			}
+		}
+		inet_ntop(AF_INET6, &addr, prefix, sizeof(prefix));
+	}
+
+	if (in6addr)
+		memcpy(in6addr, &addr, sizeof(addr));
+
+	return prefix;
+}
+
+int calc_6rd_local_prefix(const struct in6_addr *prefix,
+	int prefix_len, int relay_prefix_len,
+	const struct in_addr *local_ip,
+	struct in6_addr *local_prefix, int *local_prefix_len)
+{
+	/* the following code is based on ipv6calc's code */
+	uint32_t local_ip_bits, j;
+	int i;
+
+	if (!prefix || !local_ip || !local_prefix || !local_prefix_len) {
+		return 0;
+	}
+
+	*local_prefix_len = prefix_len + 32 - relay_prefix_len;
+	if (*local_prefix_len > 64) {
+		return 0;
+	}
+
+	local_ip_bits = ntohl(local_ip->s_addr) << relay_prefix_len;
+
+	for (i = 0; i < 4; i++) {
+		local_prefix->s6_addr32[i] = prefix->s6_addr32[i];
+	}
+
+	for (j = 0x80000000, i = prefix_len; i < *local_prefix_len; i++, j >>= 1)
+	{
+		if (local_ip_bits & j)
+			local_prefix->s6_addr[i >> 3] |= (0x80 >> (i & 0x7));
+	}
+
+	return 1;
+}
+#endif
+
+int using_dhcpc(char *prefix)
+{
+	char tmp[16];
+	switch (get_wanx_proto(prefix)) {
+		case WP_DHCP:
+		case WP_LTE:
+			return 1;
+		case WP_L2TP:
+		case WP_PPTP:
+		case WP_PPPOE: /* PPPoE with MAN */
+			return prefix_nvram_get_int(prefix, "pptp_dhcp", tmp, sizeof(tmp));
+	}
+
+	return 0;
+}
+
+#ifdef TCONFIG_BCMWL6
+int is_psta_client(int unit, int subunit)
+{
+	char *mode;
+	int ret = 0;
+
+	if (unit < 0)
+		return ret;
+
+	mode = nvram_safe_get(wl_nvname("mode", unit, subunit));
+
+	if (strcmp(mode, "psta") == 0)
+		ret = 1;
+
+	return ret;
+}
+#endif /* TCONFIG_BCMWL6 */
+
+int wl_client(int unit, int subunit)
+{
+	char *mode = nvram_safe_get(wl_nvname("mode", unit, subunit));
+
+	return ((strcmp(mode, "sta") == 0) || (strcmp(mode, "wet") == 0)
+#ifdef TCONFIG_BCMWL6
+		|| (strcmp(mode, "psta") == 0)
+#endif /* TCONFIG_BCMWL6 */
+		);
+}
+
+static int append_ifnames(char *dst, size_t size, const char *src, int add_space)
+{
+	size_t dst_len, src_len, avail;
+
+	if ((dst == NULL) || (src == NULL) || (size == 0))
+		return -1;
+
+	dst_len = strlen(dst);
+	if (dst_len >= size)
+		return -1;
+
+	src_len = strlen(src);
+	avail = size - dst_len - 1;
+
+	/* Do not append a partial interface name/list. */
+	if ((src_len > avail) || (add_space && (src_len == avail)))
+		return -1;
+
+	strlcat(dst, src, size);
+	if (add_space)
+		strlcat(dst, " ", size);
+
+	return 0;
+}
+
+int foreach_wif(int include_vifs, void *param,
+	int (*func)(int idx, int unit, int subunit, void *param))
+{
+#if !defined(TOMATO64) || defined(TOMATO64_BCM53XX)
+	char ifnames[BUF_SIZE_64 * BRIDGE_COUNT] = { 0 }; /* increase size depending on bridge count */
+	char name[BUF_SIZE_64], ifname[BUF_SIZE_64], *next = NULL;
+	int unit = -1, subunit = -1;
+	int i, ret = 0;
+#ifdef TOMATO64
+	int pass, is_vif;
+#endif /* TOMATO64 */
+
+	/* LAN interfaces */
+	for (i = 0; i < BRIDGE_COUNT; i++) {
+		if (append_ifnames(ifnames, sizeof(ifnames), bridge_nvram_get(i, "ifnames", name, sizeof(name)), 1) < 0)
+			goto list_full;
+	}
+
+	/* WAN interfaces */
+	for (i = 1; i <= MWAN_MAX; i++) {
+		snprintf(name, sizeof(name), (i == 1 ? "wan_ifnames" : "wan%d_ifnames"), i);
+		if (append_ifnames(ifnames, sizeof(ifnames), nvram_safe_get(name), 1) < 0)
+			goto list_full;
+	}
+
+	/* WL interfaces */
+#ifdef TCONFIG_AC3200
+	if (append_ifnames(ifnames, sizeof(ifnames), nvram_safe_get("wl2_ifname"), 1) < 0)
+		goto list_full;
+	if (append_ifnames(ifnames, sizeof(ifnames), nvram_safe_get("wl2_vifs"), 1) < 0)
+		goto list_full;
+#endif /* TCONFIG_AC3200 */
+	if (append_ifnames(ifnames, sizeof(ifnames), nvram_safe_get("wl_ifname"), 1) < 0)
+		goto list_full;
+	if (append_ifnames(ifnames, sizeof(ifnames), nvram_safe_get("wl0_ifname"), 1) < 0)
+		goto list_full;
+	if (append_ifnames(ifnames, sizeof(ifnames), nvram_safe_get("wl0_vifs"), 1) < 0)
+		goto list_full;
+	if (append_ifnames(ifnames, sizeof(ifnames), nvram_safe_get("wl1_ifname"), 1) < 0)
+		goto list_full;
+	if (append_ifnames(ifnames, sizeof(ifnames), nvram_safe_get("wl1_vifs"), 0) < 0)
+		goto list_full;
+
+	goto list_ready;
+
+list_full:
+	logmsg(LOG_WARNING, "%s: interface list exceeds buffer size (%zu bytes)", __FUNCTION__, sizeof(ifnames));
+
+list_ready:
+
+	remove_dups(ifnames, sizeof(ifnames));
+	sort_list(ifnames, sizeof(ifnames));
+
+#ifndef TOMATO64
+	i = 0;
+	memset(name, 0, sizeof(name)); /* reset */
+	foreach(name, ifnames, next) {
+		if (nvifname_to_osifname(name, ifname, sizeof(ifname)) != 0)
+			continue;
+
+		if (wl_probe(ifname) || wl_ioctl(ifname, WLC_GET_INSTANCE, &unit, sizeof(unit)))
+			continue;
+
+		/* Convert eth name to wl name */
+		if (osifname_to_nvifname(name, ifname, sizeof(ifname)) != 0)
+			continue;
+
+		/* Slave intefaces have a '.' in the name */
+		if (strchr(ifname, '.') && !include_vifs)
+			continue;
+
+		if (get_ifname_unit(ifname, &unit, &subunit) < 0)
+			continue;
+
+		ret |= func(i++, unit, subunit, param);
+	}
+#else /* TOMATO64 */
+	i = 0;
+	/* report every primary before any vif: the GUI indexes its per-radio arrays by callback index */
+	for (pass = 0; pass < (include_vifs ? 2 : 1); pass++) {
+		memset(name, 0, sizeof(name)); /* reset */
+		foreach(name, ifnames, next) {
+			if (nvifname_to_osifname(name, ifname, sizeof(ifname)) != 0)
+				continue;
+
+			if (wl_probe(ifname) || wl_ioctl(ifname, WLC_GET_INSTANCE, &unit, sizeof(unit)))
+				continue;
+
+			/* Convert eth name to wl name */
+			if (osifname_to_nvifname(name, ifname, sizeof(ifname)) != 0)
+				continue;
+
+			/* Slave intefaces have a '.' in the name */
+			is_vif = (strchr(ifname, '.') != NULL);
+			if (is_vif && !include_vifs)
+				continue;
+
+			if (is_vif != pass)
+				continue;
+
+			if (get_ifname_unit(ifname, &unit, &subunit) < 0)
+				continue;
+
+			ret |= func(i++, unit, subunit, param);
+		}
+	}
+#endif /* TOMATO64 */
+	return ret;
+#else /* TOMATO64 && !TOMATO64_BCM53XX */
+	return 0;
+#endif /* !TOMATO64 || TOMATO64_BCM53XX */
+}
+
+void notice_set(const char *path, const char *format, ...)
+{
+	char p[64];
+	char buf[2048];
+	va_list args;
+
+	va_start(args, format);
+	vsnprintf(buf, sizeof(buf), format, args);
+	va_end(args);
+
+	mkdir("/var/notice", 0755);
+	snprintf(p, sizeof(p), "/var/notice/%s", path);
+	f_write_string(p, buf, 0, 0);
+
+	if (buf[0])
+		logmsg(LOG_INFO, "notice[%s]: %s", path, buf);
+}
+
+int wan_led(int mode) /* mode: 0 - OFF, 1 - ON */
+{
+	int model;
+
+	logmsg(LOG_DEBUG, "*** %s: wan_led: led(LED_WHITE,%s)", __FUNCTION__, (mode ? "ON" : "OFF"));
+
+	/* get router model */
+	model = get_model();
+
+	/* check router model according to shared/led.c table, LED WHITE */
+	if (
+#ifdef TCONFIG_BCMARM
+	    (model == MODEL_RTN18U)
+	    || (model == MODEL_R7000)
+	    || (model == MODEL_EX6200)
+	    || (model == MODEL_EX7000)
+	    || (model == MODEL_R6400)
+	    || (model == MODEL_R6400v2)
+	    || (model == MODEL_R6700v1)
+	    || (model == MODEL_R6700v3)
+	    || (model == MODEL_R6900)
+	    || (model == MODEL_XR300)
+	    || (model == MODEL_RTAC67U)
+	    || (model == MODEL_DSLAC68U)
+	    || (model == MODEL_RTAC68U)
+	    || (model == MODEL_RTAC68UV3)
+	    || (model == MODEL_RTAC66U_B1)
+	    || (model == MODEL_RTAC1900P)
+	    || (model == MODEL_RTAC56U)
+	    || (model == MODEL_DIR868L)
+	    || (model == MODEL_F9K1113v2_20X0)
+	    || (model == MODEL_F9K1113v2)
+	    || (model == MODEL_WS880)
+	    || (model == MODEL_R6200v2)
+	    || (model == MODEL_R6250)
+	    || (model == MODEL_AC1450)
+	    || (model == MODEL_R6300v2)
+	    || (model == MODEL_EA6350v1)
+	    || (model == MODEL_EA6350v2)
+	    || (model == MODEL_EA6400)
+	    || (model == MODEL_EA6700)
+	    || (model == MODEL_EA6900)
+	    || (model == MODEL_R1D)
+	    || (model == MODEL_WZR1750)
+#ifdef TCONFIG_BCM714
+	    || (model == MODEL_RTAC3100)
+	    || (model == MODEL_RTAC88U)
+#endif
+#ifdef TCONFIG_AC3200
+#ifdef TCONFIG_AC5300
+	    || (model == MODEL_RTAC5300)
+#endif
+	    || (model == MODEL_RTAC3200)
+	    || (model == MODEL_R8000)
+#endif
+#else /* !TCONFIG_BCMARM */
+	    (model == MODEL_WRT54G) ||
+	    (model == MODEL_WRTSL54GS) ||
+	    (model == MODEL_DIR320) ||
+	    (model == MODEL_WL1600GL) ||
+	    (model == MODEL_WRT310Nv1) ||
+	    (model == MODEL_WRT160Nv1) ||
+	    (model == MODEL_WNR3500L) ||
+	    (model == MODEL_WRT160Nv3) ||
+	    (model == MODEL_WRT320N) ||
+	    (model == MODEL_WRT610Nv2) ||
+	    (model == MODEL_E4200)
+#ifdef TCONFIG_BCMWL6
+	    || (model == MODEL_WNR3500LV2) ||
+	    (model == MODEL_WNDR4000) ||
+	    (model == MODEL_WNDR3400) ||
+	    (model == MODEL_F9K1102) ||
+	    (model == MODEL_E900) ||
+	    (model == MODEL_E1500) ||
+	    (model == MODEL_E1550) ||
+	    (model == MODEL_E2500) ||
+	    (model == MODEL_E1000v2) ||
+	    (model == MODEL_RTN12B1) ||
+	    (model == MODEL_RTN12C1) ||
+	    (model == MODEL_RTN12HP) ||
+	    (model == MODEL_RTN15U) ||
+	    (model == MODEL_D1800H) ||
+	    (model == MODEL_TDN6) ||
+	    (model == MODEL_WNDR4500) ||
+	    (model == MODEL_WNDR4500V2) ||
+	    (model == MODEL_DIR865L)
+#endif /* TCONFIG_BCMWL6 */
+#endif /* TCONFIG_BCMARM */
+	) {
+		led(LED_WHITE, mode);
+	}
+
+	return mode;
+}
+
+int wan_led_off(char *prefix) /* off WAN LED only if no other WAN active */
+{
+	char tmp[100];
+	char ppplink_file[32];
+	char wanstr[8];
+	int f, up, proto, mwan_num, i;
+	struct ifreq ifr;
+	int count = 0; /* initialize with zero */
+	FILE *f_tmp;
+
+	mwan_num = nvram_get_int("mwan_num");
+	if (mwan_num < 1 || mwan_num > MWAN_MAX)
+		mwan_num = 1;
+
+	for (i = 1; i <= mwan_num; i++) {
+		get_wan_prefix(i, wanstr);
+
+		up = 0; /* default is 0 (LED_OFF) */
+		if (!strcmp(prefix, wanstr))
+			continue; /* only check others */
+
+		logmsg(LOG_DEBUG, "*** %s: check %s aliveness...", __FUNCTION__, wanstr);
+
+		switch (proto = get_wanx_proto(wanstr)) {
+			case WP_DISABLED:
+				break; /* WAN is disabled - skip */
+			case WP_STATIC:
+			case WP_DHCP:
+			case WP_LTE:
+				if (!prefix_nvram_match(wanstr, "ipaddr", "0.0.0.0", tmp, sizeof(tmp))) { /* have IP, assume ON */
+					up = 1;
+					if (((f = socket(AF_INET, SOCK_DGRAM, 0)) >= 0)) { /* check interface */
+						strlcpy(ifr.ifr_name, prefix_nvram_get(wanstr, "iface", tmp, sizeof(tmp)), sizeof(ifr.ifr_name));
+						if (ioctl(f, SIOCGIFFLAGS, &ifr) < 0)
+							up = 0;
+						close(f);
+						if ((ifr.ifr_flags & IFF_UP) == 0 || (ifr.ifr_flags & IFF_RUNNING) == 0)
+							up = 0;
+						if (proto == WP_STATIC) { /* check port state for static */
+
+							int a;		/* port number: 0/1/2/3/4 */
+							char b[16];	/* port state: DOWN/SPEED */
+							int c;		/* port vlan: 1/2/3/4/etc */
+							char d[4];
+							FILE *f = NULL;
+
+							strcpy(d, &ifr.ifr_name[4]); /* trim vlan */
+							int vlannum = atoi(d);
+/* Skip  this test in T64 for now */
+#ifndef TOMATO64
+							if ((f = popen("/usr/sbin/robocfg showports", "r")) != NULL) {
+								while (fgets(tmp, sizeof(tmp), f)) {
+									if (sscanf(tmp, "Port %d: %s %*s %*s %*s vlan: %d %*s", &a, b, &c) == 3) {
+										if ((strncmp(b, "DOWN", 4) == 0) && (c == vlannum)) {
+											logmsg(LOG_DEBUG, "*** %s: state = DOWN for vlan%d", __FUNCTION__, vlannum);
+											up = 0;
+										}
+									}
+								}
+								pclose(f);
+							}
+#endif /* TOMATO64 */
+						}
+					}
+				}
+				if (up)
+					++count;
+				break;
+			case WP_L2TP:
+			case WP_PPTP:
+			case WP_PPPOE:
+			case WP_PPP3G:
+				f_tmp = NULL;
+				snprintf(ppplink_file, sizeof(ppplink_file), "/tmp/ppp/%s_link", wanstr);
+				if ((f_tmp = fopen(ppplink_file, "r")) != NULL) { /* have PPP link, assume ON */
+					up = 1;
+					fclose(f_tmp);
+				}
+				if (up)
+					++count;
+				break;
+			default:
+				break;
+		}
+	}
+
+	if (count > 0) {
+		logmsg(LOG_DEBUG, "*** %s: OUT - %s, active WANs count:%d, stay on", __FUNCTION__, prefix, count);
+		return count; /* do not LED OFF */
+	}
+	else {
+		logmsg(LOG_DEBUG, "*** %s: OUT - %s, no other active WANs, turn off led", __FUNCTION__, prefix);
+		return wan_led(LED_OFF); /* LED OFF */
+	}
+}
+
+/* function for rstats, cstats, httpd */
+long check_wanup_time(char *prefix)
+{
+	long wanuptime = 0; /* wanX uptime in seconds */
+	struct sysinfo si;
+	long uptime;
+	char wanuptime_file[64];
+
+	sysinfo(&si); /* get time */
+	snprintf(wanuptime_file, sizeof(wanuptime_file), "/var/lib/misc/%s_time", prefix);
+
+	if (f_read(wanuptime_file, &uptime, sizeof(uptime)) == sizeof(uptime)) {
+		wanuptime = si.uptime - uptime; /* calculate the difference */
+		if (wanuptime < 0) /* something wrong? */
+			wanuptime = 0;
+	}
+	else {
+		wanuptime = 0; /* something wrong? f_read()? */
+	}
+
+	return wanuptime;
+}
+
+int check_wanup(char *prefix)
+{
+	FILE *f;
+	int up = 0;
+	int proto;
+	char buf1[64];
+	char buf2[64];
+	const char *name;
+	int s;
+	struct ifreq ifr;
+	char tmp[100];
+	char ppplink_file[64];
+	char pppd_name[16];
+
+	proto = get_wanx_proto(prefix);
+
+	if (proto == WP_DISABLED) {
+		return 0;
+	}
+
+	if ((proto == WP_PPTP) || (proto == WP_L2TP) || (proto == WP_PPPOE) || (proto == WP_PPP3G)) {
+		snprintf(ppplink_file, sizeof(ppplink_file), "/tmp/ppp/%s_link", prefix);
+
+		if (f_read_string(ppplink_file, buf1, sizeof(buf1)) > 0) {
+			/* contains the base name of a file in /var/run/ containing pid of a daemon */
+			snprintf(buf2, sizeof(buf2), "/var/run/%s.pid", buf1);
+
+			if (f_read_string(buf2, buf1, sizeof(buf1)) > 0) {
+				name = psname(atoi(buf1), buf2, sizeof(buf2));
+
+				if (proto == WP_L2TP)
+					strlcpy(pppd_name, "pppd", sizeof(pppd_name));
+				else
+					snprintf(pppd_name, sizeof(pppd_name), "pppd%s", prefix);
+
+				logmsg(LOG_DEBUG, "*** %s: %s pppd name=%s, psname=%s", __FUNCTION__, (proto == WP_L2TP ? "L2TP" : ""), pppd_name, name);
+
+				if (strcmp(name, pppd_name) == 0)
+					up = 1;
+			}
+			else {
+				logmsg(LOG_DEBUG, "*** %s: error reading %s", __FUNCTION__, buf2);
+			}
+			if (!up) {
+				unlink(ppplink_file); /* stale PPP connection fix, also used in wan_led_off */
+				logmsg(LOG_DEBUG, "*** %s: required daemon not found, assuming link is dead", __FUNCTION__);
+			}
+		}
+		else {
+			logmsg(LOG_DEBUG, "*** %s: error reading %s", __FUNCTION__, ppplink_file);
+		}
+	}
+	else if (!prefix_nvram_match(prefix, "ipaddr", "0.0.0.0", tmp, sizeof(tmp))) {
+		logmsg(LOG_DEBUG, "*** %s: %s have IP, assume ON", __FUNCTION__, prefix);
+		up = 1;
+	}
+	else {
+		logmsg(LOG_DEBUG, "*** %s: default !up", __FUNCTION__);
+		goto state; /* don't turn off WAN LED */
+	}
+
+	if ((up) && ((s = socket(AF_INET, SOCK_DGRAM, 0)) >= 0)) {
+		strlcpy(ifr.ifr_name, prefix_nvram_get(prefix, "iface", tmp, sizeof(tmp)), sizeof(ifr.ifr_name));
+
+		if (ioctl(s, SIOCGIFFLAGS, &ifr) < 0) {
+			up = 0;
+			logmsg(LOG_DEBUG, "*** %s: SIOCGIFFLAGS", __FUNCTION__);
+		}
+		close(s);
+
+		if (((ifr.ifr_flags & IFF_UP) == 0) || ((ifr.ifr_flags & IFF_RUNNING) == 0)) {
+			up = 0;
+			logmsg(LOG_DEBUG, "*** %s: !IFF_UP || !IFF_RUNNING", __FUNCTION__);
+		}
+
+		if (proto == WP_STATIC) {
+			/* Ethernet WAN port state checker (static IF is always UP and RUNNING)
+			   ifr.ifr_name = vlan2, vlan3 etc
+			   nvram get vlan2ports
+			   4 5
+			   nvram get vlan3ports
+			   1 5
+			   robocfg showports
+			   Switch: enabled
+			   Port 0: 1000FD enabled stp: none vlan: 1 jumbo: off mac: 00:00:80:00:00:00
+			   Port 1:   DOWN enabled stp: none vlan: 3 jumbo: off mac: 00:00:00:00:00:00
+			   Port 2:   DOWN enabled stp: none vlan: 1 jumbo: off mac: 00:00:00:00:00:00
+			   Port 3:   DOWN enabled stp: none vlan: 1 jumbo: off mac: 00:00:00:00:00:00
+			   Port 4:  100FD enabled stp: none vlan: 2 jumbo: off mac: 00:00:00:00:00:00
+			   Port 8:   DOWN enabled stp: none vlan: 1 jumbo: off mac: 00:00:00:00:00:00
+			*/
+
+			int a;		/* port number: 0/1/2/3/4 */
+			char b[16];	/* port state: DOWN/SPEED */
+			int c;		/* port vlan: 1/2/3/4/etc */
+			char d[4];
+			FILE *f;
+
+			strcpy(d, &ifr.ifr_name[4]); /* trim vlan */
+			int vlannum = atoi(d);
+			logmsg(LOG_DEBUG, "*** %s: %s vlan num: %d", __FUNCTION__, prefix, vlannum);
+
+/* Skip  this test in T64 for now */
+#ifndef TOMATO64
+			if ((f = popen("/usr/sbin/robocfg showports", "r")) != NULL) {
+				while (fgets(tmp, sizeof(tmp), f)) {
+					if (sscanf(tmp, "Port %d: %s %*s %*s %*s vlan: %d %*s", &a, b, &c) == 3) {
+						if ((strncmp(b, "DOWN", 4) == 0) && (c == vlannum)) {
+							logmsg(LOG_DEBUG, "*** %s: port state = DOWN for vlan%d", __FUNCTION__, vlannum);
+							up = 0;
+						}
+					}
+				}
+				pclose(f);
+			}
+#endif /* TOMATO64 */
+		}
+	}
+
+state:
+	if (up) { /* also check result from mwwatchdog */
+		if ((nvram_get_int("mwan_cktime") == 0) || prefix_nvram_get_int(prefix, "ck_pause", buf1, sizeof(buf1))) /* skip checking on this WAN */
+			return up;
+
+		snprintf(buf1, sizeof(buf1), "/var/lib/misc/%s_state", prefix);
+		if ((f = fopen(buf1, "r")) == NULL) /* no state file? so probably wan is just up */
+			return up;
+
+		fscanf(f, "%d", &up);
+		fclose(f);
+	}
+	logmsg(LOG_DEBUG, "*** %s: state of %s is %d", __FUNCTION__, prefix, up);
+	return up;
+}
+
+const dns_list_t *get_dns(char *prefix)
+{
+	static dns_list_t dns;
+	char s[512];
+	int n;
+	int i, j;
+	struct in_addr ia;
+	char d[7][22];
+	unsigned short port;
+	char *c;
+	char tmp[100];
+
+	dns.count = 0;
+
+	if (prefix_nvram_get_int(prefix, "dns_auto", tmp, sizeof(tmp)))
+		snprintf(s, sizeof(s), " %s", prefix_nvram_get(prefix, "get_dns", tmp, sizeof(tmp)));
+	else {
+		strlcpy(s, prefix_nvram_get(prefix, "dns", tmp, sizeof(tmp)), sizeof(s));
+		if ((!prefix_nvram_get_int(prefix, "addget", tmp, sizeof(tmp)))
+#ifdef TCONFIG_DNSCRYPT
+		    || (nvram_get_int("dnscrypt_proxy") && nvram_get_int("dnscrypt_priority") == 2) /* just to be sure */
+#endif
+#ifdef TCONFIG_STUBBY
+		    || (nvram_get_int("stubby_proxy") && nvram_get_int("stubby_priority") == 2) /* just to be sure */
+#endif
+		) {
+			/* do nothing */
+		}
+		else {
+			/* add received DNS servers to the static DNS server list */
+			logmsg(LOG_DEBUG, "*** %s: adding received servers (%s) to the static DNS server list", __FUNCTION__, prefix_nvram_get(prefix, "get_dns", tmp, sizeof(tmp)));
+			snprintf(s + strlen(s), sizeof(s) - strlen(s), " %s", prefix_nvram_get(prefix, "get_dns", tmp, sizeof(tmp)));
+		}
+	}
+
+	n = sscanf(s, "%21s %21s %21s %21s %21s %21s %21s", d[0], d[1], d[2], d[3], d[4], d[5], d[6]);
+	for (i = 0; i < n; ++i) {
+		port = 53;
+
+		if ((c = strchr(d[i], ':')) != NULL) {
+			*c++ = 0;
+			if (((j = atoi(c)) < 1) || (j > 0xFFFF))
+				continue;
+
+			port = j;
+		}
+
+		if (inet_pton(AF_INET, d[i], &ia) > 0) {
+			for (j = dns.count - 1; j >= 0; --j) {
+				if ((dns.dns[j].addr.s_addr == ia.s_addr) && (dns.dns[j].port == port))
+					break;
+			}
+			if (j < 0) {
+				dns.dns[dns.count].port = port;
+				dns.dns[dns.count++].addr.s_addr = ia.s_addr;
+				if (dns.count == 6)
+					break;
+			}
+		}
+	}
+
+	return &dns;
+}
+
+void set_action(int a)
+{
+	int r = 3;
+	while (f_write("/var/lock/action", &a, sizeof(a), 0, 0) != sizeof(a)) {
+		sleep(1);
+		if (--r == 0)
+			return;
+	}
+	if (a != ACT_IDLE)
+		sleep(2);
+}
+
+int check_action(void)
+{
+	int a;
+	int r = 3;
+
+	while (f_read("/var/lock/action", &a, sizeof(a)) != sizeof(a)) {
+		sleep(1);
+		if (--r == 0)
+			return ACT_UNKNOWN;
+	}
+
+	return a;
+}
+
+int wait_action_idle(int n)
+{
+	while (n-- > 0) {
+		if (check_action() == ACT_IDLE)
+			return 1;
+		sleep(1);
+	}
+
+	return 0;
+}
+
+const wanface_list_t *get_wanfaces(char *prefix)
+{
+	static wanface_list_t wanfaces;
+	char *ip, *iface;
+	int proto;
+	char tmp[32];
+
+	wanfaces.count = 0;
+
+	proto = get_wanx_proto(prefix);
+
+	if ((proto == WP_PPTP) || (proto == WP_L2TP) ||
+	    ((proto == WP_PPPOE) && using_dhcpc(prefix))) {
+		while (wanfaces.count < 2) {
+			if (wanfaces.count == 0) {
+				ip = prefix_nvram_get(prefix, "ppp_get_ip", tmp, sizeof(tmp));
+				iface = prefix_nvram_get(prefix, "iface", tmp, sizeof(tmp));
+				if (!(*iface))
+					iface = "ppp+";
+			}
+			else {
+				ip = prefix_nvram_get(prefix, "ipaddr", tmp, sizeof(tmp));
+				if (!(*ip) || strcmp(ip, "0.0.0.0") == 0)
+					iface = "";
+				else
+					iface = prefix_nvram_get(prefix, "ifname", tmp, sizeof(tmp));
+			}
+
+			strlcpy(wanfaces.iface[wanfaces.count].ip, ip, sizeof(wanfaces.iface[0].ip));
+			strlcpy(wanfaces.iface[wanfaces.count].name, iface, IFNAMSIZ);
+			++wanfaces.count;
+		}
+	}
+	else {
+		ip = (proto == WP_DISABLED) ? "0.0.0.0" : prefix_nvram_get(prefix, "ipaddr", tmp, sizeof(tmp));
+
+		if ((proto == WP_PPPOE) || (proto == WP_PPP3G)) {
+			iface = prefix_nvram_get(prefix, "iface", tmp, sizeof(tmp));
+			if (!(*iface))
+				iface = "ppp+";
+		}
+		else
+			iface = prefix_nvram_get(prefix, "ifname", tmp, sizeof(tmp));
+
+		strlcpy(wanfaces.iface[wanfaces.count].ip, ip, sizeof(wanfaces.iface[0].ip));
+		strlcpy(wanfaces.iface[wanfaces.count++].name, iface, IFNAMSIZ);
+	}
+
+	return &wanfaces;
+}
+
+const char *get_wanface(char *prefix)
+{
+	return (*get_wanfaces(prefix)).iface[0].name;
+}
+
+#ifdef TCONFIG_IPV6
+const char *get_wan6face(void)
+{
+	switch (get_ipv6_service()) {
+		case IPV6_NATIVE:
+		case IPV6_NATIVE_DHCP:
+			return get_wanface("wan");
+		case IPV6_ANYCAST_6TO4:
+			return "v6to4";
+		case IPV6_6IN4:
+			return "v6in4";
+		case IPV6_6RD:
+			return "6rd";
+		case IPV6_6RD_DHCP:
+			return "6rd-pd";
+	}
+
+	return nvram_safe_get("ipv6_ifname");
+}
+#endif
+
+const char *get_wanip(char *prefix)
+{
+	if (!check_wanup(prefix))
+		return "0.0.0.0";
+
+	return (*get_wanfaces(prefix)).iface[0].ip;
+}
+
+const char *getifaddr(char *ifname, int family, int linklocal)
+{
+	static char buf[INET6_ADDRSTRLEN];
+	void *addr = NULL;
+	struct ifaddrs *ifap, *ifa;
+
+	if (getifaddrs(&ifap) != 0) {
+		logmsg(LOG_DEBUG, "*** %s: getifaddrs failed: %s", __FUNCTION__, strerror(errno));
+		return NULL;
+	}
+
+	for (ifa = ifap; ifa; ifa = ifa->ifa_next) {
+		if ((ifa->ifa_addr == NULL) ||
+		    (strncmp(ifa->ifa_name, ifname, IFNAMSIZ) != 0) ||
+		    (ifa->ifa_addr->sa_family != family))
+			continue;
+
+#ifdef TCONFIG_IPV6
+		if (ifa->ifa_addr->sa_family == AF_INET6) {
+			struct sockaddr_in6 *s6 = (struct sockaddr_in6 *)(ifa->ifa_addr);
+			if (IN6_IS_ADDR_LINKLOCAL(&s6->sin6_addr) ^ linklocal)
+				continue;
+			addr = (void *)&(s6->sin6_addr);
+		}
+		else
+#endif
+		{
+			struct sockaddr_in *s = (struct sockaddr_in *)(ifa->ifa_addr);
+			addr = (void *)&(s->sin_addr);
+		}
+
+		if ((addr) && inet_ntop(ifa->ifa_addr->sa_family, addr, buf, sizeof(buf)) != NULL) {
+			freeifaddrs(ifap);
+			return buf;
+		}
+	}
+
+	freeifaddrs(ifap);
+
+	return NULL;
+}
+
+int is_intf_up(const char* ifname)
+{
+	struct ifreq ifr;
+	int sfd;
+	int ret = 0;
+
+	if (!((sfd = socket(AF_INET, SOCK_RAW, IPPROTO_RAW)) < 0)) {
+		strlcpy(ifr.ifr_name, ifname, sizeof(ifr.ifr_name));
+		if (!ioctl(sfd, SIOCGIFFLAGS, &ifr) && (ifr.ifr_flags & IFF_UP))
+			ret = 1;
+
+		close(sfd);
+	}
+
+	return ret;
+}
+
+long get_uptime(void)
+{
+	struct sysinfo si;
+	sysinfo(&si);
+
+	return si.uptime;
+}
+
+char *wl_nvname(const char *nv, int unit, int subunit)
+{
+	static char tmp[128];
+	char prefix[] = "wlXXXXXXXXXX_";
+
+	if (unit < 0)
+		strlcpy(prefix, "wl_", sizeof(prefix));
+	else if (subunit > 0)
+		snprintf(prefix, sizeof(prefix), "wl%d.%d_", unit, subunit);
+	else
+		snprintf(prefix, sizeof(prefix), "wl%d_", unit);
+
+	return strlcat_r(prefix, nv, tmp, sizeof(tmp));
+}
+
+int get_radio(int unit)
+{
+	uint32 n;
+
+	return (wl_ioctl(nvram_safe_get(wl_nvname("ifname", unit, 0)), WLC_GET_RADIO, &n, sizeof(n)) == 0) &&
+		((n & WL_RADIO_SW_DISABLE)  == 0);
+}
+
+void set_radio(int on, int unit)
+{
+	uint32 n;
+
+#ifndef WL_BSS_INFO_VERSION
+#error WL_BSS_INFO_VERSION
+#endif
+
+#if WL_BSS_INFO_VERSION >= 108
+	n = on ? (WL_RADIO_SW_DISABLE << 16) : ((WL_RADIO_SW_DISABLE << 16) | 1);
+	wl_ioctl(nvram_safe_get(wl_nvname("ifname", unit, 0)), WLC_SET_RADIO, &n, sizeof(n));
+	if (!on) {
+		if (unit == 0)
+			led(LED_WLAN, LED_OFF);
+#ifdef TCONFIG_RTNPLUS /* RT-N+ */
+		if (unit == 1)
+			led(LED_5G, LED_OFF);
+#ifdef TCONFIG_AC3200
+		if (unit == 2)
+			led(LED_52G, LED_OFF);
+#endif /* TCONFIG_AC3200 */
+#endif /* TCONFIG_RTNPLUS */
+	}
+	else {
+		if (unit == 0)
+			led(LED_WLAN, LED_ON);
+#ifdef TCONFIG_RTNPLUS /* RT-N+ */
+		if (unit == 1)
+			led(LED_5G, LED_ON);
+#ifdef TCONFIG_AC3200
+		if (unit == 2)
+			led(LED_52G, LED_ON);
+#endif /* TCONFIG_AC3200 */
+#endif /* TCONFIG_RTNPLUS */
+	}
+#else /* WL_BSS_INFO_VERSION >= 108 */
+	n = on ? 0 : WL_RADIO_SW_DISABLE;
+	wl_ioctl(nvram_safe_get(wl_nvname("ifname", unit, 0)), WLC_SET_RADIO, &n, sizeof(n));
+	if (!on) {
+		led(LED_WLAN, LED_OFF);
+	}
+	else {
+		led(LED_WLAN, LED_ON);
+	}
+#endif /* WL_BSS_INFO_VERSION >= 108 */
+}
+
+int mtd_getinfo(const char *mtdname, int *part, int *size)
+{
+	FILE *f;
+	char s[256];
+	char t[256];
+	int r;
+
+	r = 0;
+	if ((strlen(mtdname) < 128) && (strcmp(mtdname, "pmon") != 0)) {
+		snprintf(t, sizeof(t), "\"%s\"", mtdname);
+		if ((f = fopen("/proc/mtd", "r")) != NULL) {
+			while (fgets(s, sizeof(s), f) != NULL) {
+				if ((sscanf(s, "mtd%d: %x", part, size) == 2) && (strstr(s, t) != NULL)) {
+					/* don't accidentally mess with bl (0) */
+					if (*part > 0)
+						r = 1;
+					break;
+				}
+			}
+			fclose(f);
+		}
+	}
+	if (!r) {
+		*size = 0;
+		*part = -1;
+	}
+	return r;
+}
+
+int nvram_get_int(const char *key)
+{
+	return atoi(nvram_safe_get(key));
+}
+
+/*
+long nvram_xget_long(const char *name, long min, long max, long def)
+{
+	const char *p;
+	char *e;
+	long n;
+
+	p = nvram_get(name);
+	if ((p != NULL) && (*p != 0)) {
+		n = strtol(p, &e, 0);
+		if ((e != p) && ((*e == 0) || (*e == ' ')) && (n > min) && (n < max)) {
+			return n;
+		}
+	}
+	return def;
+}
+*/
+
+int nvram_get_file(const char *key, const char *fname, int max)
+{
+	int n;
+	char *p;
+	unsigned char *b;
+	int r;
+
+	r = 0;
+	p = nvram_safe_get(key);
+	n = strlen(p);
+	if (n <= max) {
+		if ((b = malloc(base64_decoded_len(n) + 128)) != NULL) {
+			n = base64_decode(p, b, n);
+			if (n > 0)
+				r = (f_write(fname, b, n, 0, 0644) == n);
+			free(b);
+		}
+	}
+	return r;
+/*
+	char b[2048];
+	int n;
+	char *p;
+
+	p = nvram_safe_get(key);
+	n = strlen(p);
+	if (n <= max) {
+		n = base64_decode(p, b, n);
+		if (n > 0) return (f_write(fname, b, n, 0, 0700) == n);
+	}
+	return 0;
+*/
+}
+
+int nvram_set_file(const char *key, const char *fname, int max)
+{
+	char *in;
+	char *out;
+	long len;
+	int n;
+	int r;
+
+	if ((len = f_size(fname)) > max)
+		return 0;
+
+	max = (int)len;
+	r = 0;
+	if (f_read_alloc(fname, &in, max) == max) {
+		if ((out = malloc(base64_encoded_len(max) + 128)) != NULL) {
+			n = base64_encode((unsigned char *)in, out, max);
+			out[n] = 0;
+			nvram_set(key, out);
+			free(out);
+			r = 1;
+		}
+		free(in);
+	}
+	return r;
+/*
+	char a[2048];
+	char b[4096];
+	int n;
+
+	if (((n = f_read(fname, &a, sizeof(a))) > 0) && (n <= max)) {
+		n = base64_encode(a, b, n);
+		b[n] = 0;
+		nvram_set(key, b);
+		return 1;
+	}
+	return 0;
+*/
+}
+
+int nvram_contains_word(const char *key, const char *word)
+{
+	return (find_word(nvram_safe_get(key), word) != NULL);
+}
+
+int nvram_is_empty(const char *key)
+{
+	char *p;
+
+	return (((p = nvram_get(key)) == NULL) || (*p == 0));
+}
+
+void nvram_commit_x(void)
+{
+	if (!nvram_get_int("debug_nocommit"))
+		nvram_commit();
+}
+
+char *getNVRAMVar(const char *text, const int unit)
+{
+	char buffer[256];
+	snprintf(buffer, sizeof(buffer), text, unit);
+
+	return nvram_safe_get(buffer);
+}
+
+void chld_reap(int sig)
+{
+	while (waitpid(-1, NULL, WNOHANG) > 0) {}
+}
+
+void gen_urandom(char *buf1, unsigned char *buf2, size_t buf_sz, const unsigned int addtid)
+{
+	unsigned long long sn = 0;
+
+	if (buf1) {
+		f_read("/dev/urandom", &sn, sizeof(sn));
+		if (addtid)
+			snprintf(buf1, buf_sz, "TID%llx", sn);
+		else
+			snprintf(buf1, buf_sz, "%llu", sn & 0x7FFFFFFFFFFFFFFFULL);
+	}
+	else {
+		memset((char *)buf2, 0, buf_sz);
+		f_read("/dev/urandom", buf2, buf_sz);
+	}
+}

@@ -1,0 +1,10 @@
+#ifndef __TOMATO_VERSION_H__
+#define __TOMATO_VERSION_H__
+#define TOMATO_MAJOR		"2026"
+#define TOMATO_MINOR		"4"
+#define TOMATO_BUILD		"004"
+#define TOMATO_BUILDTIME	""
+#define TOMATO_VERSION		"2026.4 BCM53XX AIO"
+#define TOMATO_SHORTVER		"2026.4"
+#define TOMATO_NIGHTLY		""
+#endif
