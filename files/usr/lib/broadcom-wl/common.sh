@@ -109,34 +109,37 @@ bcw_unit_to_ifname() {
 #
 # wlconf builds the chanspec from wl<N>_channel plus wl<N>_nmode / _vhtmode /
 # _bw_cap / _nctrlsb (wlconf.c, the WLCONF_PHYTYPE_11N branch around line 2327).
-# bw_cap is a WL_BW_CAP_* bit: 1=20MHz, 2=40MHz, 4=80MHz.
+# bw_cap is the *cumulative* WLC_BW_CAP_* mask, not a single bit: wlconf
+# compares it against WLC_BW_CAP_80MHZ (0x7) and only then picks the wide
+# chanspec, so a bare 0x4 falls back to 20MHz. 20MHz=0x1, 40MHz=0x3, 80MHz=0x7
+# (20|40|80).
 
 bcw_apply_htmode() {
 	_unit="$1"; _htmode="$2"; _band="$3"; _channel="$4"
-	_nmode=1; _vht=0; _bwcap=1; _ctrlsb=""
+	_nmode=1; _vht=0; _bwcap=1; _width=20; _ctrlsb=""
 
 	case "$_htmode" in
-	NOHT|"") _nmode=0; _bwcap=1 ;;
-	HT20)    _nmode=1; _bwcap=1 ;;
-	HT40|HT40+|HT40-) _nmode=1; _bwcap=2 ;;
-	VHT20)   _nmode=1; _vht=1; _bwcap=1 ;;
-	VHT40|HT40B) _nmode=1; _vht=1; _bwcap=2 ;;
-	VHT80)   _nmode=1; _vht=1; _bwcap=4 ;;
-	VHT160)  _nmode=1; _vht=1; _bwcap=8 ;;
+	NOHT|"") _nmode=0; _bwcap=1;  _width=20 ;;
+	HT20)    _nmode=1; _bwcap=1;  _width=20 ;;
+	HT40|HT40+|HT40-) _nmode=1; _bwcap=3; _width=40 ;;
+	VHT20)   _nmode=1; _vht=1; _bwcap=1;  _width=20 ;;
+	VHT40|HT40B) _nmode=1; _vht=1; _bwcap=3; _width=40 ;;
+	VHT80)   _nmode=1; _vht=1; _bwcap=7;  _width=80 ;;
+	VHT160)  _nmode=1; _vht=1; _bwcap=15; _width=160 ;;
 	esac
 
 	# 40MHz needs a control sideband. HT40+/- spells it out; bare HT40/VHT40
 	# derives it the way wlconf's own fallback does.
-	if [ "$_bwcap" = 2 ]; then
+	if [ "$_width" = 40 ]; then
 		case "$_htmode" in
 		HT40+) _ctrlsb="upper" ;;
 		HT40-) _ctrlsb="lower" ;;
 		*)
 			if [ "$_band" = 2g ]; then
-				[ "$_channel" -lt 7 ] 2>/dev/null && _ctrlsb="upper" || _ctrlsb="lower"
+				[ "$_channel" -lt 7 ] 2>/dev/null && _ctrlsb="lower" || _ctrlsb="upper"
 			else
-				# 5GHz: even /4 -> upper, odd -> lower.
-				[ $(( _channel / 4 % 2 )) = 1 ] 2>/dev/null && _ctrlsb="upper" || _ctrlsb="lower"
+				# 5GHz: block start (36,44,..) -> lower, block end (40,48,..) -> upper.
+				[ $(( _channel / 4 % 2 )) = 1 ] 2>/dev/null && _ctrlsb="lower" || _ctrlsb="upper"
 			fi
 			;;
 		esac
@@ -144,7 +147,7 @@ bcw_apply_htmode() {
 
 	# 80MHz needs the 80MHz control-word (ll/lu/ul/uu). "ll" is the safe
 	# default and what most APs use.
-	if [ "$_bwcap" = 4 ] && [ -z "$_ctrlsb" ]; then
+	if [ "$_width" = 80 ] && [ -z "$_ctrlsb" ]; then
 		_ctrlsb="ll"
 	fi
 
@@ -153,6 +156,23 @@ bcw_apply_htmode() {
 	bcw_nvset "wl${_unit}_bw_cap" "$_bwcap"
 	bcw_nvset "wl${_unit}_nbw_cap" "$_bwcap"
 	[ -n "$_ctrlsb" ] && bcw_nvset "wl${_unit}_nctrlsb" "$_ctrlsb"
+}
+
+# First legal channel for the band, as reported by the driver. Used to turn UCI
+# "auto" into a concrete channel: there is no usable ACS here -- wlconf's auto
+# path (wlconf_auto_chanspec) applies a 20MHz chanspec and ignores the
+# configured width -- whereas a concrete channel goes through the width-aware
+# chanspec path. Falls back to the band's first channel if wl cannot be queried.
+bcw_first_channel() {
+	_i="$1"; _b="$2"; _c=""
+	for _v in $(wl -i "$_i" channels 2>/dev/null); do _c="$_v"; break; done
+	if [ -z "$_c" ]; then
+		case "$_b" in
+		2g|11b|11g|b|g) _c=1 ;;
+		*)              _c=36 ;;
+		esac
+	fi
+	echo "$_c"
 }
 
 # ---------------------------------------------------------------------------
@@ -255,14 +275,17 @@ bcw_radio_apply() {
 	bcw_nvset "wl${_unit}_radio" 1
 	bcw_nvset "wl${_unit}_bss_enabled" 1
 
-	# Channel. UCI "auto" means 0 (let the driver pick / ACS is not available
-	# here, so this is "first legal channel").
+	# Channel. UCI "auto" has no usable ACS here (wlconf's auto path applies a
+	# 20MHz chanspec and ignores the configured width), so resolve it to the
+	# first legal channel for the band. A concrete channel goes through the
+	# width-aware chanspec path in wlconf instead.
 	case "$CHANNEL" in
-	""|auto) bcw_nvset "wl${_unit}_channel" 0 ;;
-	*)       bcw_nvset "wl${_unit}_channel" "$CHANNEL" ;;
+	""|auto) _channel="$(bcw_first_channel "$_ifname" "$BAND")" ;;
+	*)       _channel="$CHANNEL" ;;
 	esac
+	bcw_nvset "wl${_unit}_channel" "$_channel"
 
-	bcw_apply_htmode "$_unit" "$HTMODE" "$BAND" "${CHANNEL:-0}"
+	bcw_apply_htmode "$_unit" "$HTMODE" "$BAND" "$_channel"
 
 	[ -n "$COUNTRY" ] && bcw_nvset "wl${_unit}_country_code" "$COUNTRY"
 	[ -n "$TXPOWER" ] && bcw_nvset "wl${_unit}_tpc_db" "$TXPOWER"

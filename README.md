@@ -136,6 +136,20 @@ enable. It translates UCI into the `wl<N>_*` NVRAM keys the tools read, drives
 `wlconf`/`eapd`/`nas`, and reports the interfaces back to netifd. The init
 script (`/etc/init.d/broadcom-wl`) owns module load and the radio unbind.
 
+### HT/VHT width and channel
+
+`htmode` maps to the driver's bandwidth capability `wl<N>_bw_cap`, which is the
+*cumulative* `WLC_BW_CAP_*` mask — 20MHz=0x1, 40MHz=0x3, 80MHz=0x7 — because
+wlconf compares it against `WLC_BW_CAP_80MHZ`/`_40MHZ` and only then programs a
+wide chanspec. A bare single bit (e.g. 0x4 for 80MHz) fails that test and
+silently leaves the AP at 20MHz. For 40MHz the control sideband
+(`wl<N>_nctrlsb`) is derived from the band and channel.
+
+There is no usable ACS here, so UCI `channel 'auto'` is resolved to the first
+legal channel for the band (as reported by `wl channels`); wlconf's own auto
+path applies a 20MHz chanspec and ignores the configured width, whereas a
+concrete channel is programmed with the requested width.
+
 ### LuCI and `libiwinfo`
 
 LuCI does not talk to the netifd handler directly: `rpcd-mod-luci` describes the
