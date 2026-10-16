@@ -459,14 +459,193 @@ bcw_security_start() {
 		start-stop-daemon -S -x /usr/sbin/nas -b -- \
 			>>"$BCW_RUNDIR/nas.log" 2>&1
 	fi
+
+	# Remember what eapd is bound *to*, so a later ensure pass can tell a
+	# healthy daemon from one whose packet socket went stale (bridge
+	# replaced, hence a new ifindex, or lan_ifname rewritten underneath it).
+	bcw_daemon_mark "$_bridge"
 }
 
 bcw_security_stop() {
 	start-stop-daemon -K -x /usr/sbin/nas  >/dev/null 2>&1
 	start-stop-daemon -K -x /usr/sbin/eapd >/dev/null 2>&1
+
+	# start-stop-daemon -K only *sends* TERM. nas returns immediately, but
+	# eapd unwinds its select loop over ~0.6s, so pidof still reports it for
+	# a while. A caller that restarts straight away sees that pid, skips the
+	# start, and ends up with nas but no eapd -- and with no 0x886c relay the
+	# four-way handshake silently never completes (client shows "wrong
+	# password"). So wait until they are really gone; busybox sleep is
+	# integer-only here and usleep is absent, hence the 1s granularity.
+	_i=0
+	while [ "$_i" -lt 3 ]; do
+		pidof nas >/dev/null 2>&1 || pidof eapd >/dev/null 2>&1 || break
+		sleep 1
+		_i=$((_i + 1))
+	done
+	# One that outlived the grace period only delays the restart: insist.
+	for _p in $(pidof nas) $(pidof eapd); do kill -9 "$_p" 2>/dev/null; done
+	return 0
 }
 
 # ---------------------------------------------------------------------------
+# Network hotplug repair
+# ---------------------------------------------------------------------------
+#
+# netifd runs /etc/hotplug.d/iface/* for *every* interface, wan included, and a
+# PPPoE link flaps ifup/ifdown repeatedly while it negotiates. Everything
+# eapd/nas need is keyed off the LAN bridge, so the WAN path is dangerous:
+#
+#   * eapd reads lan_ifname ONCE at startup and binds its ETHER_TYPE_BRCM
+#     packet socket to that bridge (eapd_linux.c:eapd_brcm_open). Handing it
+#     "br-wan" makes SIOCGIFINDEX fail, eapd never sees another 0x886c EAPOL
+#     frame, and nas -- whose only receive path is eapd's relay -- completes no
+#     handshake. The client then reports an authentication failure, i.e. "wrong
+#     password", even though the passphrase is right.
+#   * Killing nas on a WAN ifdown produces exactly the same symptom.
+#
+# So every entry point below resolves the LAN bridge *itself* and never derives
+# one from $INTERFACE. Together these are the "plugging in the ISP cable breaks
+# Wi-Fi" fix and the shared general guard for any user.
+
+# The bridge the wl radios belong to. netifd names it br-<network> (default
+# br-lan); prefer whichever bridge already carries a wl member, which is the
+# runtime truth, and fall back to br-lan before the radios are enslaved.
+bcw_lan_bridge() {
+	[ -n "${BCW_LAN_BRIDGE:-}" ] && { echo "$BCW_LAN_BRIDGE"; return 0; }
+	for _b in /sys/class/net/br-*; do
+		[ -d "$_b/brif" ] || continue
+		for _m in "$_b"/brif/wl*; do
+			[ -e "$_m" ] || continue
+			basename "$_b"
+			return 0
+		done
+	done
+	echo "br-lan"
+}
+
+# MAC address of a live netdev, or "" when it does not exist.
+bcw_ifmac() {
+	[ -r "/sys/class/net/$1/address" ] && cat "/sys/class/net/$1/address"
+}
+
+# Bump the last octet by BCW_MAC_OFFSET (default 2), wrapping, OUI preserved.
+# The step is 2 rather than 1 on purpose: +1 from the factory WAN MAC
+# (...:44:ab here) lands on another port's address, and the point of this
+# guard is to separate two *L2* domains, not to reshuffle a single switch.
+bcw_mac_offset() {
+	_off="${BCW_MAC_OFFSET:-2}"
+	_oifs="$IFS"; IFS=':'
+	# shellcheck disable=SC2086
+	set -- $1
+	IFS="$_oifs"
+	[ $# -eq 6 ] || return 1
+	_last="$(printf '%d' "0x$6")" || return 1
+	printf '%s:%s:%s:%s:%s:%02x\n' "$1" "$2" "$3" "$4" "$5" \
+		"$(( (_last + _off) % 256 ))"
+}
+
+# Persist a device's macaddr in /etc/config/network (netifd only applies it on
+# reload, so the caller also applies it live).
+bcw_uci_set_devmac() {
+	command -v uci >/dev/null 2>&1 || return 0
+	for _s in $(uci -q show network 2>/dev/null | \
+		sed -n 's/^network\.\([^.]*\)=device$/\1/p'); do
+		[ "$(uci -q get "network.$_s.name")" = "$1" ] || continue
+		[ "$(uci -q get "network.$_s.macaddr")" = "$2" ] && return 0
+		uci -q set "network.$_s.macaddr=$2"
+		uci -q commit network
+		return 0
+	done
+	return 0
+}
+
+# wan and the LAN bridge must not share a MAC. Users cloning a router's address
+# from FreshTomato/DD-WRT typically copy the old `et0macaddr' (or just
+# `CC:E1:D5:9D:44:AA') onto `wan', which collides with the shared MAC OpenWrt
+# derives br-lan from on the B53 switch (all of eth0/lan1..lan4/br-lan start
+# out as ...:44:aa). With both on the same switch the MAC learning table flaps
+# between the LAN and WAN sides and bridged frames get black-holed. Detect it,
+# move br-lan clear of wan, and leave wan alone -- the ISP PPPoE session owns
+# that address.
+bcw_mac_collision_guard() {
+	_bridge="$1"; _wan="${2:-wan}"
+	_bmac="$(bcw_ifmac "$_bridge")"; _wmac="$(bcw_ifmac "$_wan")"
+	[ -n "$_bmac" ] && [ -n "$_wmac" ] || return 0
+	[ "$_bmac" = "$_wmac" ] || return 0
+	_new="$(bcw_mac_offset "$_bmac")" || return 0
+	[ -n "$_new" ] && [ "$_new" != "$_wmac" ] || return 0
+	logger -t broadcom-wl "$_bridge MAC $_bmac collides with $_wan ($_wmac); moving $_bridge to $_new"
+	ip link set "$_bridge" address "$_new" 2>/dev/null
+	bcw_uci_set_devmac "$_bridge" "$_new"
+	return 0
+}
+
+# Keep every radio UP and a member of the LAN bridge. netifd is the owner of
+# enslavement (it reports each netdev through set_vif()), so this only repairs
+# a port it has dropped or left down; a membership that is already correct is a
+# no-op, and nothing here can run when the bridge is absent.
+bcw_ensure_bridge_member() {
+	_bridge="$1"
+	[ -d "/sys/class/net/$_bridge" ] || return 0
+	for _if in $(bcw_all_wl_ifaces); do
+		ip link set "$_if" up 2>/dev/null
+		_cur="$(basename "$(readlink "/sys/class/net/$_if/master" 2>/dev/null)" 2>/dev/null)"
+		[ "$_cur" = "$_bridge" ] && continue
+		ip link set "$_if" master "$_bridge" 2>/dev/null || \
+			brctl addif "$_bridge" "$_if" 2>/dev/null
+	done
+	return 0
+}
+
+# eapd marks (bridge + ifindex) it was started against.
+bcw_daemon_mark() {
+	_bridge="$1"
+	_idx="$(cat "/sys/class/net/$_bridge/ifindex" 2>/dev/null)"
+	printf '%s %s\n' "$_bridge" "$_idx" > "$BCW_RUNDIR/daemons.state"
+}
+
+# Full repair pass for one interface event: MAC hygiene, NVRAM identity, radio
+# membership, and (re)start of eapd+nas whenever their binding went stale.
+# Safe to call on every event -- each step is idempotent.
+bcw_security_ensure() {
+	_bridge="${1:-$(bcw_lan_bridge)}"
+	[ -n "$_bridge" ] || _bridge="br-lan"
+	[ -n "$(bcw_all_wl_ifaces)" ] || return 0
+
+	bcw_mac_collision_guard "$_bridge"
+
+	# The NVRAM keys eapd/nas/libshared resolve the radios through.
+	bcw_nvset "lan_ifname" "$_bridge"
+	_lan="$(bcw_nvget lan_ifnames)"
+	for _if in $(bcw_all_wl_ifaces); do
+		case " $_lan " in
+		*" $_if "*) : ;;
+		*) _lan="$(echo $_lan $_if)"; bcw_nvset lan_ifnames "$_lan" ;;
+		esac
+	done
+	_hw="$(bcw_ifmac "$_bridge")"
+	[ -n "$_hw" ] && bcw_nvset lan_hwaddr "$_hw"
+
+	bcw_ensure_bridge_member "$_bridge"
+
+	# If eapd is alive but was started against a different bridge, or the
+	# bridge has since been recreated (new ifindex), its PF_PACKET bind is
+	# stale and no EAPOL frame will ever reach nas again -- restart both.
+	_state="$(cat "$BCW_RUNDIR/daemons.state" 2>/dev/null)"
+	_cur="$(cat "/sys/class/net/$_bridge/ifindex" 2>/dev/null)"
+	if [ -n "$(pidof eapd 2>/dev/null)" ] && \
+	   [ "$_state" != "$_bridge $_cur" ]; then
+		logger -t broadcom-wl \
+			"eapd bound to '${_state:-nothing}' but LAN bridge is '$_bridge $_cur'; restarting eapd+nas"
+		bcw_security_stop
+	fi
+
+ 	bcw_security_start "$_bridge"
+ 	return 0
+ }
+
+ # ---------------------------------------------------------------------------
 # Defaults seeded once, from the init script
 # ---------------------------------------------------------------------------
 
@@ -651,11 +830,13 @@ bcw_main() {
 	config-repair)   bcw_radio_config_repair ;;
 	security-start) shift; bcw_security_start "$@" ;;
 	security-stop)  bcw_security_stop ;;
+	net-repair)     shift; bcw_security_ensure "$@" ;;
+	mac-guard)      shift; bcw_mac_collision_guard "$@" ;;
 	ifname)  bcw_band_to_ifname "$2" ;;
 	nvset)   bcw_nvset "$2" "$3" ;;
 	nvget)   bcw_nvget "$2" ;;
 	*)
-		echo "usage: broadcom-wl-ctl {seed|handler-single|handler-restore|iwinfo-install|iwinfo-restore|config-repair|apply <file>|up <unit>|down <unit>|security-start <if> <bridge>|security-stop|ifname <band>|nvset <k> <v>|nvget <k>}" >&2
+		echo "usage: broadcom-wl-ctl {seed|handler-single|handler-restore|iwinfo-install|iwinfo-restore|config-repair|apply <file>|up <unit>|down <unit>|security-start <if> <bridge>|security-stop|net-repair [<bridge>]|mac-guard [<bridge>] [<wan>]|ifname <band>|nvset <k> <v>|nvget <k>}" >&2
 		return 1
 		;;
 	esac

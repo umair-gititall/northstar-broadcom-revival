@@ -1,22 +1,44 @@
 #!/bin/sh
 #
-# (Re)start the WPA daemons when a bridge that carries a wl radio comes up.
+# Repair the broadcom WPA path whenever an interface changes state.
 #
-# The netifd handler already starts eapd/nas at setup time, but eapd binds its
-# packet socket to the *bridge* (get_ifname_by_wlmac() -> lan_ifname), and the
-# bridge may not have finished coming up at that point. This hook is the
-# second chance: it runs after the network interface is configured.
+# netifd runs /etc/hotplug.d/iface/* for *every* interface, wan included, and a
+# PPPoE link flaps ifup/ifdown repeatedly while it negotiates. This script used
+# to derive its bridge from $INTERFACE, which is exactly the "plug in the ISP
+# cable and phones report Wrong password" bug:
+#
+#   * ifup passed "br-$INTERFACE" to security-start, so a WAN ifup overwrote
+#     lan_ifname -- the bridge eapd binds its ETHER_TYPE_BRCM packet socket to
+#     (eapd_linux.c:eapd_brcm_open) -- with the nonexistent "br-wan". eapd
+#     then never sees another 0x886c EAPOL frame;
+#   * ifdown called security-stop unconditionally, so a WAN ifdown killed nas.
+#
+# With either in play the 4-way handshake can never complete and the client
+# reports an authentication failure even though the passphrase is right.
+#
+# All the logic lives in common.sh (broadcom-wl-ctl net-repair), which resolves
+# the LAN bridge itself. Never derive a bridge name from $INTERFACE here.
 
 BCW_NO_MAIN=1 . /usr/lib/broadcom-wl/common.sh
 
 [ -n "$(bcw_all_wl_ifaces)" ] || exit 0
 
+_lan_bridge="$(bcw_lan_bridge)"
+
 case "$ACTION" in
-ifup)
-	bcw_security_start "br-$INTERFACE"
+ifup|ifupdate)
+	# MAC hygiene (wan vs br-lan collision), radio membership/UP, lan_hwaddr,
+	# and eapd+nas restart only if their bridge/ifindex binding went stale.
+	/usr/sbin/broadcom-wl-ctl net-repair "$_lan_bridge"
 	;;
 ifdown)
-	bcw_security_stop
+	# Tear the daemons down only with the LAN bridge itself. A WAN ifdown
+	# (PPPoE flapping) must leave nas and eapd running.
+	if [ "br-$INTERFACE" = "$_lan_bridge" ] || \
+	   [ "$INTERFACE" = "${_lan_bridge#br-}" ]; then
+		bcw_security_stop
+		rm -f "$BCW_RUNDIR/daemons.state"
+	fi
 	;;
 esac
 
