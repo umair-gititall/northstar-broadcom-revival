@@ -333,10 +333,13 @@ This repository does **not** ship packages in upstream OpenWrt feeds. Build the 
 
 **Installing built APKs:**
 
-1. Copy both packages to the router (replace `*` with the correct release):
+1. Copy both packages to the router (Dropbear on stock OpenWrt lacks `sftp-server`, so `scp` may fail — use the pipe method below):
 ```sh
-scp kmod-broadcom-wl-*.apk broadcom-wl-*.apk root@192.168.1.1:/tmp/
+for f in kmod-broadcom-wl-*.apk broadcom-wl-*.apk; do
+  cat "$f" | ssh root@192.168.1.1 "cat > /tmp/$(basename "$f")"
+done
 ```
+(If your SSH client supports the legacy SCP protocol, `scp -O ...` may also work. If using a custom SSH config, pass `-F <config>` to `ssh`.)
 
 2. Install them locally:
 ```sh
