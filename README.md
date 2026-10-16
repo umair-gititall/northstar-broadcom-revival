@@ -329,23 +329,23 @@ kernel's own hotplug driver.
 
 ## Installation
 
-### Packages
+This repository does **not** ship packages in upstream OpenWrt feeds. Build the APKs from source (or download a GitHub Release), then install them locally on your router.
 
+**Installing prebuilt APKs:**
+
+1. Copy both packages to the router (replace `*` with the correct release):
 ```sh
-apk update
-apk add broadcom-wl          # pulls kmod-broadcom-wl + userspace + integration
+scp kmod-broadcom-wl-*.apk broadcom-wl-*.apk root@192.168.1.1:/tmp/
 ```
 
-`broadcom-wl` is the userspace and OpenWrt glue; `kmod-broadcom-wl` is the
-module. They move together.
+2. Install them locally:
+```sh
+ssh root@192.168.1.1 "apk add --allow-untrusted /tmp/kmod-broadcom-wl-*.apk /tmp/broadcom-wl-*.apk"
+```
 
-Installing the userspace package triggers one automatic reboot: its `postinst`
-schedules a reboot once the pair is in place. netifd reads
-`/etc/config/wireless` only at startup, before `wl.ko` has claimed the radios,
-so without the reboot the wireless daemons come up with the stock no-driver
-view and never see the broadcom radios until the next boot. The reboot is
-deferred and detached so `apk` finishes and reports success first; wait for the
-box to come back up before configuring.
+`broadcom-wl` is the userspace and OpenWrt glue; `kmod-broadcom-wl` is the kernel module. They move together.
+
+The userspace package's `postinst` triggers a **one-time automatic reboot** once both packages are in place. netifd reads `/etc/config/wireless` only at startup, before `wl.ko` has claimed the radios; without the reboot, wireless daemons start under the stock no-driver view and may not properly initialize until the next boot. The reboot is deferred and detached so `apk` finishes and reports success first — **wait for the router to come back up before configuring Wi-Fi**.
 
 ### The stock-kernel radio handover
 
@@ -526,16 +526,55 @@ The resulting `wl.ko` taints the kernel, which is correct and expected.
 
 ## Building from source
 
-The normal path is the OpenWrt package (root `Makefile`). To build by hand
-against a kernel tree:
+There are two ways to build this package. The recommended path for OpenWrt targets is inside an OpenWrt SDK.
 
+### Option 1: Build inside the OpenWrt SDK (recommended)
+
+The exact workflow used for the verified builds in this repository:
+
+1. **Get an OpenWrt SDK for bcm53xx/generic (25.12.5)** — e.g. `openwrt-sdk-25.12.5-bcm53xx-generic_gcc-14.3.0_musl_eabi.Linux-x86_64.tar.xz`.
+
+2. **Clone this repository into the SDK's package directory** (or symlink it). The SDK's `make` will discover `package/broadcom-wl/Makefile`:
+```sh
+cd /path/to/openwrt-sdk-25.12.5-bcm53xx-generic_*
+mkdir -p package
+git clone https://github.com/umair-gititall/northstar-broadcom-revival.git package/broadcom-wl
+cd package/broadcom-wl
+```
+
+3. **Fetch vendor blobs and verify sha256sums**:
+```sh
+./fetch.sh
+```
+This downloads `wl_apsta.o` and the prebuilt `wl` tool from FreshTomato (pinned revision) and verifies them against `sha256sums.txt`.
+
+4. **Compile and package the APKs**:
+```sh
+cd ../..  # back to SDK root
+make package/broadcom-wl/clean
+make package/broadcom-wl/compile V=s
+make package/broadcom-wl/package/index V=s
+```
+
+After a successful build, the SDK places the APKs in:
+- `bin/packages/arm_cortex-a9_vfpv3-d16/base/kmod-broadcom-wl-<kver>.<drvver>-r<release>.apk`
+- `bin/packages/arm_cortex-a9_vfpv3-d16/base/broadcom-wl-<drvver>-r<release>.apk`
+
+For example, the verified r6 build produced:
+- `kmod-broadcom-wl-6.12.94.6.37.14.126-r6.apk`
+- `broadcom-wl-6.37.14.126-r6.apk`
+
+Copy these to your router and install as shown in [Installation](#installation).
+
+### Option 2: Build standalone (kernel/userspace outside SDK)
+
+For users building against a separate kernel tree (e.g. for testing):
 ```sh
 ./fetch.sh
 make -f Makefile.standalone OBJCOPY=<cross-objcopy> wl_apsta.o_shipped
 make -C <linux-6.12-tree> M=$PWD ARCH=arm CROSS_COMPILE=<abs-path>- modules
 make -f Makefile.standalone userspace CROSS_COMPILE=<abs-path>-
 ```
-
 `CROSS_COMPILE` must be absolute — the kernel `cd`s during the build.
 
 ## Credits
