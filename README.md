@@ -209,6 +209,14 @@ apk add broadcom-wl          # pulls kmod-broadcom-wl + userspace + integration
 `broadcom-wl` is the userspace and OpenWrt glue; `kmod-broadcom-wl` is the
 module. They move together.
 
+Installing the userspace package triggers one automatic reboot: its `postinst`
+schedules a reboot once the pair is in place. netifd reads
+`/etc/config/wireless` only at startup, before `wl.ko` has claimed the radios,
+so without the reboot the wireless daemons come up with the stock no-driver
+view and never see the broadcom radios until the next boot. The reboot is
+deferred and detached so `apk` finishes and reports success first; wait for the
+box to come back up before configuring.
+
 ### The stock-kernel radio handover
 
 Stock OpenWrt builds bcma with `CONFIG_BCMA_HOST_PCI=y`, so the built-in

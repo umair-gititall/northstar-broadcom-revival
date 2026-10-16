@@ -155,6 +155,15 @@ define Package/broadcom-wl/postinst
 	# can describe the radios. Also re-asserted from init.d at every boot, in
 	# case a libiwinfo package upgrade clobbers the symlink.
 	[ -x /usr/sbin/broadcom-wl-ctl ] && /usr/sbin/broadcom-wl-ctl iwinfo-install 2>/dev/null
+
+	# A freshly installed driver is inert until the next boot: netifd reads
+	# /etc/config/wireless once at startup, before wl.ko claims the radios, so
+	# the wireless daemons come up with the stock no-driver view and stay that
+	# way until rebooted. This package is the last of the pair to install (the
+	# userspace package depends on the kmod), so schedule a reboot here -- once,
+	# detached, so apk finishes and reports success before the box goes down --
+	# and a single install step then leaves a working radio set.
+	( sleep 3; /sbin/reboot ) </dev/null >/dev/null 2>&1 &
 }
 exit 0
 endef
