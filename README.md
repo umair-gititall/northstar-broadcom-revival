@@ -26,17 +26,31 @@ that driver for OpenWrt's kernel.
 
 ## Supported hardware
 
-| device | SoC | radios |
+**Note:** This blob supports many Broadcom PCIe Wi-Fi chipsets. The configuration in this repository has only been tested on the **Buffalo WZR-1750DHP** (BCM4708A0 with BCM4331 + BCM4360). All other chipsets listed below are **untested** and may require additional NVRAM/board configuration.
+
+### Known supported Broadcom PCIe Wi-Fi chip IDs (from wl 6.37.14.126 blob/headers)
+
+| Chipset | PCI Device IDs | Bands | Common SoCs/Platforms |
+|---|---|---|---|
+| BCM4331 | 0x4331 (Dual), 0x4332 (2.4G), 0x4333 (5G) | N | BCM4708 |
+| BCM4360 | 0x43a0 (AC Dual), 0x43a1 (AC 2.4G), 0x43a2 (AC 5G) | AC | BCM4708/4709 |
+| BCM4352 | 0x43b1 (AC Dual), 0x43b2 (AC 2.4G), 0x43b3 (AC 5G) | AC | BCM4709-class |
+| BCM43228 | 0x4359 (N Dual), 0x435a (N 5G) | N | BCM4707/4708-class |
+| BCM43217 | 0x43a9 (N 2.4G) | N | BCM4707-class |
+| BCM43222 | 0x432b (N Dual), 0x432c (N 2.4G), 0x432d (N 5G) | N | Various bcm53xx |
+| BCM43131 | 0x43aa (N 2.4G) | N | BCM4707 |
+| BCM4345 | 0x43ab (AC Dual), 0x43ac (AC 2.4G), 0x43ad (AC 5G) | AC | Various |
+| BCM4335 | 0x43ae (AC Dual), 0x43af (AC 2.4G), 0x43b0 (AC 5G) | AC | Various |
+| BCM4350 | 0x43a3 (AC Dual), 0x43a4 (AC 2.4G), 0x43a5 (AC 5G) | AC | Various |
+| BCM43602 | 0x43ba (AC Dual), 0x43bb (AC 2.4G), 0x43bc (AC 5G) | AC | BCM4709B0+ |
+
+### Tested boards (this port)
+
+| Device | SoC | Radios |
 |---|---|---|
 | **Buffalo WZR-1750DHP** | BCM4708A0 | BCM4331 (2.4 GHz) + BCM4360 (5 GHz) |
-| Netgear R7000 | BCM4709A0 | 2× BCM4360 |
-| generally | BCM4708/4709 | BCM4331/BCM4360-class PCIe radios |
 
-Target: OpenWrt 25.12.x, `bcm53xx/generic`, Linux 6.12.x. The blob is SMP,
-ARMv7-A, Thumb-2, soft-float EABI, GCC 4.5.3, driver version
-`6.37.14.126 (r561982)`.
-
-## What it builds
+Target: OpenWrt 25.12.x, `bcm53xx/generic`, Linux 6.12.x. The blob is SMP, ARMv7-A, Thumb-2, soft-float EABI, GCC 4.5.3, driver version `6.37.14.126 (r561982)`.## What it builds
 
 | artifact | install | what it is |
 |---|---|---|
