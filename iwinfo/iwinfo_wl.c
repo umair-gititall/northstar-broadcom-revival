@@ -185,10 +185,68 @@ static int wl_get_bssid(const char *ifname, char *buf)
 	return ret;
 }
 
+/* Broadcom chanspec fields, see shared/bcmwifi/include/bcmwifi_channels.h */
+#define WL_CHSPEC_BW_MASK	0x3800
+#define WL_CHSPEC_BW_10		0x0800
+#define WL_CHSPEC_BW_20		0x1000
+#define WL_CHSPEC_BW_40		0x1800
+#define WL_CHSPEC_BW_80		0x2000
+#define WL_CHSPEC_BW_160	0x2800
+#define WL_CHSPEC_BW_8080	0x3000
+#define WL_CHSPEC_CTL_SB_MASK	0x0700
+#define WL_CHSPEC_CTL_SB_SHIFT	8
+
 static int wl_get_channel(const char *ifname, int *buf)
 {
+	char res[16];
+	uint16_t chspec = 0;
+	int chan, ctl_sb, ctl;
 	int ret;
 	int channel[4];	/* WLC_GET_CHANNEL returns channel_info_t (12 bytes) */
+
+	/*
+	 * For a wide channel WLC_GET_CHANNEL reports the *center* channel, but
+	 * everything that consumes this (LuCI, and the same value mac80211
+	 * returns) expects the control/primary channel. Derive it from the
+	 * chanspec's control sideband instead.
+	 */
+	memset(res, 0, sizeof(res));
+	if (!wl_iovar(ifname, "chanspec", NULL, 0, res, sizeof(res)))
+	{
+		memcpy(&chspec, res, sizeof(chspec));
+
+		chan = chspec & 0xff;
+		ctl_sb = (chspec & WL_CHSPEC_CTL_SB_MASK) >> WL_CHSPEC_CTL_SB_SHIFT;
+
+		switch (chspec & WL_CHSPEC_BW_MASK)
+		{
+			case WL_CHSPEC_BW_40:
+				ctl = (ctl_sb & 1) ? chan + 2 : chan - 2;
+				break;
+
+			case WL_CHSPEC_BW_80:
+				ctl = chan + ((ctl_sb == 0) ? -6 : (ctl_sb == 1) ? -2 :
+				              (ctl_sb == 2) ?  2 :  6);
+				break;
+
+			case WL_CHSPEC_BW_160:
+				ctl = chan + ((ctl_sb == 0) ? -14 : (ctl_sb == 1) ? -10 :
+				              (ctl_sb == 2) ?  -6 : (ctl_sb == 3) ?  -2 :
+				              (ctl_sb == 4) ?   2 : (ctl_sb == 5) ?   6 :
+				              (ctl_sb == 6) ?  10 :  14);
+				break;
+
+			default:	/* 5/10/20 MHz: channel is the control channel */
+				ctl = chan;
+				break;
+		}
+
+		if (ctl > 0)
+		{
+			*buf = ctl;
+			return 0;
+		}
+	}
 
 	memset(channel, 0, sizeof(channel));
 
@@ -844,15 +902,6 @@ static int wl_get_frequency_offset(const char *ifname, int *buf)
 	*buf = 0;
 	return -1;
 }
-
-/* Broadcom chanspec bandwidth field, see shared/bcmwifi/include/bcmwifi_channels.h */
-#define WL_CHSPEC_BW_MASK	0x3800
-#define WL_CHSPEC_BW_10		0x0800
-#define WL_CHSPEC_BW_20		0x1000
-#define WL_CHSPEC_BW_40		0x1800
-#define WL_CHSPEC_BW_80		0x2000
-#define WL_CHSPEC_BW_160	0x2800
-#define WL_CHSPEC_BW_8080	0x3000
 
 static int wl_get_htmode(const char *ifname, int *buf)
 {

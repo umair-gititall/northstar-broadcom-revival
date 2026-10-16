@@ -166,7 +166,7 @@ installed at the canonical path directly — that file belongs to the stock
 `/usr/lib/broadcom-wl/` and the init script re-asserts the symlink every boot (§
 `bcw_iwinfo_install`).
 
-Two things make that backend usable from LuCI:
+Three things make that backend usable from LuCI:
 
 - **Section names.** LuCI addresses a radio by its UCI `wifi-device` section
   (`radio0`), not by its netdev, and the driver only knows `wl<N>`. The nl80211
@@ -183,6 +183,13 @@ Two things make that backend usable from LuCI:
   channels via `WLC_GET_VALID_CHANNELS` instead of delegating to wext, which
   always came back empty on `wl`. The init script's `config-repair` step heals a
   config that was damaged before the swap.
+- **Wide channels.** For a wide channel `WLC_GET_CHANNEL` returns the *center*
+  channel, so an 80 MHz AP on 36/80 (center 42) would be reported as channel 42.
+  `wl_get_channel()` instead derives the control/primary channel from the
+  chanspec's bandwidth and control sideband, matching what mac80211 returns
+  (36). LuCI's frequency widget selects its value from the UCI `channel` option
+  rather than from this, so the impact is limited to the channel shown in the
+  status output, but the value is now correct.
 
 netifd discovers wireless handlers by globbing `/lib/netifd/wireless/*.sh` and
 its reader loop does not stop at EOF, so with more than one handler present it
