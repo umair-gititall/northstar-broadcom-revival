@@ -1,0 +1,10 @@
+#!/bin/sh
+#
+# AP rocker / second slider line (gpio 14, DT "AP", BTN_0). The Router/AP/WB
+# slider uses both lines; this script fires whenever the AP line changes so the
+# combined state stays current even if only one contact moves first. All real
+# work is delegated to the "mode" decoder.
+
+[ -x /usr/lib/broadcom-wl/buttons/mode ] || return 0
+BUTTON=mode ACTION=released SEEN=0 /usr/lib/broadcom-wl/buttons/mode
+return 0

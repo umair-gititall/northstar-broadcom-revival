@@ -1,0 +1,88 @@
+#!/bin/sh
+#
+# Back-panel mode slider (gpio 13, "Mode", DT key KEY_SETUP). Procd would have
+# delivered this as a switch; broadcom-wl-buttond reproduces that and also
+# publishes every line's level in /var/run/broadcom-wl/buttons.state so we can
+# see the whole slider at once.
+#
+# The WZR-1750DHP slider is Router <-> AP <-> WB (a.k.a. the "Auto/Manual"
+# rocker plus the Router/AP/WB position). We do not know the exact encoder
+# truth table for every board revision, so the safe default is: log the change,
+# recolour the Router/Status LED, and only touch Wi-Fi when the user opts in
+# via uci (broadcom-wl.mode_switch_action = 'log' | 'killswitch' | 'ap-mode').
+# Nothing here ever touches eth0/br-lan, so SSH/LAN access cannot be lost.
+
+STATE_FILE="/var/run/broadcom-wl/buttons.state"
+BLUE_ROUTER="/sys/class/leds/bcm53xx:blue:router"
+
+state_get() {
+	[ -r "$STATE_FILE" ] || { echo "1"; return; }
+	v="$(sed -n "s/^$1=//p" "$STATE_FILE")"
+	echo "${v:-1}"
+}
+
+set_led() { [ -d "$1" ] && echo "$2" > "$1/brightness" 2>/dev/null; }
+
+mode_get() { state_get mode; }
+ap_get()   { state_get ap; }
+
+# Decode the two switch lines into a human mode label. Lines are active-low,
+# so 0 = engaged. The documented WZR-1750DHP positions are Router (both
+# released), AP, and WB; we map the observed combinations and fall back to a
+# raw description for anything unexpected.
+decode() {
+	m="$1"; a="$2"
+	if [ "$m" = "1" ] && [ "$a" = "1" ]; then echo "Router"; return; fi
+	if [ "$m" = "0" ] && [ "$a" = "0" ]; then echo "AP"; return; fi
+	if [ "$m" = "1" ] && [ "$a" = "0" ]; then echo "WB"; return; fi
+	echo "unknown(mode=$m,ap=$a)"
+}
+
+action="$(uci -q get broadcom-wl.mode_switch_action)"
+[ -z "$action" ] && action="log"
+
+m="$(mode_get)"; a="$(ap_get)"
+name="$(decode "$m" "$a")"
+logger -t broadcom-wl-button "mode switch: $name (mode=$m ap=$a action=$action)"
+
+case "$name" in
+Router)
+	# Router mode: blue:router solid (the "router position" reminder; this
+	# board has no separate logo LED). amber:router is left to the Internet
+	# logic in broadcom-wl-leds, which owns it.
+	set_led "$BLUE_ROUTER" 1
+	;;
+AP|WB)
+	# Bridge/repeater: blue:router off - unmistakable at a glance.
+	set_led "$BLUE_ROUTER" 0
+	;;
+*)
+	set_led "$BLUE_ROUTER" 1
+	;;
+esac
+
+case "$action" in
+killswitch)
+	# Opt-in radio killswitch off Router mode (never touches the LAN bridge).
+	if [ "$name" = "Router" ]; then
+		uci -q set wireless.radio0.disabled=0
+		uci -q set wireless.radio1.disabled=0
+	else
+		uci -q set wireless.radio0.disabled=1
+		uci -q set wireless.radio1.disabled=1
+	fi
+	uci commit wireless
+	wifi up 2>/dev/null
+	;;
+ap-mode)
+	# Opt-in: force AP/bridge behaviour by name only; the actual network
+	# reconfiguration is left to the operator (documented in README).
+	:
+	;;
+*)
+	: # log-only (default)
+	;;
+esac
+
+[ -x /usr/sbin/broadcom-wl-leds ] && broadcom-wl-leds apply
+return 0

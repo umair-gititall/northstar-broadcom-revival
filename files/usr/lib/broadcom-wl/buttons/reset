@@ -1,0 +1,66 @@
+#!/bin/sh
+#
+# Reset button (gpio 11). Enhanced stock behaviour with LED feedback:
+#
+#   < 2s   : log and ignore
+#   2-5s   : reboot, amber (red) power blinking while shutting down
+#   > 5s   : rapid flash + factory reset (jffs2reset)
+#   timeout: failsafe entry (procd convention, 5s hold)
+#
+# Lives in /usr/lib/broadcom-wl/buttons (buttond's first search dir) because
+# /etc/rc.button/reset is owned by base-files - overwriting it would make the
+# package uninstallable.
+
+POWER_LED="/sys/class/leds/bcm53xx:red:power"
+
+led_pattern() {
+	[ -d "$POWER_LED" ] || return 0
+	echo timer > "$POWER_LED/trigger" 2>/dev/null
+	echo "$1" > "$POWER_LED/delay_on" 2>/dev/null
+	echo "$2" > "$POWER_LED/delay_off" 2>/dev/null
+}
+
+led_restore() {
+	[ -d "$POWER_LED" ] || return 0
+	echo none > "$POWER_LED/trigger" 2>/dev/null
+	echo 0 > "$POWER_LED/brightness" 2>/dev/null
+}
+
+case "$ACTION" in
+pressed)
+	# Acknowledge immediately with a slow blink so the user knows the
+	# press registered; the pattern tightens on timeout/factory intent.
+	led_pattern 500 500
+	return 0
+	;;
+timeout)
+	# Held >= 5s: rapid flash announces the factory-reset window.
+	led_pattern 100 100
+	logger -t broadcom-wl-button "reset: held >=5s - factory reset on release"
+	return 0
+	;;
+released)
+	led_restore
+	if [ "$SEEN" -lt 2 ]; then
+		logger -t broadcom-wl-button "reset: short press (${SEEN}s) ignored"
+	elif [ "$SEEN" -ge 5 ]; then
+		echo "FACTORY RESET" > /dev/console 2>/dev/null
+		logger -t broadcom-wl-button "reset: factory reset (held ${SEEN}s)"
+		led_pattern 100 100
+		sync
+		if command -v jffs2reset >/dev/null 2>&1; then
+			jffs2reset -y && reboot &
+		else
+			factoryreset -y && reboot &
+		fi
+	else
+		logger -t broadcom-wl-button "reset: reboot (held ${SEEN}s)"
+		led_pattern 250 250
+		sync
+		reboot
+	fi
+	return 0
+	;;
+esac
+
+return 0

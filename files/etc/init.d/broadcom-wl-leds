@@ -1,0 +1,15 @@
+#!/bin/sh /etc/rc.common
+
+START=95
+
+start() {
+	[ -x /usr/sbin/broadcom-wl-leds ] && /usr/sbin/broadcom-wl-leds init
+}
+
+stop() {
+	return 0
+}
+
+reload() {
+	[ -x /usr/sbin/broadcom-wl-leds ] && /usr/sbin/broadcom-wl-leds apply
+}

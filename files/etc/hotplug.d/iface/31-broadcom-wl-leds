@@ -1,0 +1,13 @@
+#!/bin/sh
+
+BCW_NO_MAIN=1 . /usr/lib/broadcom-wl/common.sh
+
+[ -x /usr/sbin/broadcom-wl-leds ] || exit 0
+
+case "$ACTION" in
+ifup|ifdown|ifupdate)
+	/usr/sbin/broadcom-wl-leds apply >/dev/null 2>&1 &
+	;;
+esac
+
+exit 0

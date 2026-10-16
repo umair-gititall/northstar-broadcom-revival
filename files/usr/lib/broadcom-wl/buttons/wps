@@ -1,0 +1,83 @@
+#!/bin/sh
+#
+# AOSS/WPS button (gpio 12, held by broadcom-wl-buttond).
+#
+#   short press (< 3s): toggle both Wi-Fi radios on/off
+#   long press  (>= 3s): cycle band mode Dual -> 5GHz only -> 2.4GHz only -> Dual
+#
+# While the button is held, amber:wireless blinks so the press is visible; on
+# release the normal LED logic is re-applied. The pressed/timeout handlers must
+# return *fast* (buttond waits ~1s for a button script's exit status to honour
+# procd's "return N -> timeout in N seconds" convention), so the ack only arms
+# the timer trigger and returns - it never sleeps.
+
+AMBER="/sys/class/leds/bcm53xx:amber:wireless"
+
+blink_on() {
+	[ -d "$AMBER" ] || return 0
+	echo timer > "$AMBER/trigger" 2>/dev/null
+	echo 150 > "$AMBER/delay_on" 2>/dev/null
+	echo 150 > "$AMBER/delay_off" 2>/dev/null
+}
+
+led_apply() {
+	[ -x /usr/sbin/broadcom-wl-leds ] && /usr/sbin/broadcom-wl-leds apply
+}
+
+BOTH() { [ "$1" = "0" ] && [ "$2" = "0" ]; }
+
+case "$ACTION" in
+pressed)
+	# Immediate visual ack, then ask buttond for a 3s timeout callback so a
+	# held press can be told apart before the release arrives.
+	blink_on
+	exit 3
+	;;
+timeout)
+	# Held past 3s: stay blinking (band-selection mode) and log it.
+	logger -t broadcom-wl-button "wps: held >=3s - band selection mode"
+	return 0
+	;;
+released)
+	r0="$(uci -q get wireless.radio0.disabled)"; [ -z "$r0" ] && r0=0
+	r1="$(uci -q get wireless.radio1.disabled)"; [ -z "$r1" ] && r1=0
+
+	if [ "$SEEN" -lt 3 ]; then
+		# Toggle: any enabled -> all disabled, else all enabled.
+		if BOTH "$r0" "$r1"; then
+			new=1
+		else
+			new=0
+		fi
+		uci -q set wireless.radio0.disabled="$new"
+		uci -q set wireless.radio1.disabled="$new"
+		uci commit wireless
+		logger -t broadcom-wl-button "wps: toggling radios (disabled=$new)"
+	else
+		# Cycle band mode from the current pair of disabled flags.
+		if BOTH "$r0" "$r1"; then
+			# Dual -> 5GHz only (disable 2.4G = radio0)
+			uci -q set wireless.radio0.disabled=1
+			uci -q set wireless.radio1.disabled=0
+			mode=5GHz-only
+		elif [ "$r0" = "1" ] && [ "$r1" = "0" ]; then
+			# 5GHz only -> 2.4GHz only
+			uci -q set wireless.radio0.disabled=0
+			uci -q set wireless.radio1.disabled=1
+			mode=2.4GHz-only
+		else
+			# 2.4GHz only (or partial) -> Dual
+			uci -q set wireless.radio0.disabled=0
+			uci -q set wireless.radio1.disabled=0
+			mode=Dual-band
+		fi
+		uci commit wireless
+		logger -t broadcom-wl-button "wps: cycling band mode -> $mode"
+	fi
+	wifi up 2>/dev/null
+	led_apply
+	return 0
+	;;
+esac
+
+return 0

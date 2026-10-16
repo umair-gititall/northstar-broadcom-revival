@@ -1,0 +1,179 @@
+#!/bin/sh
+#
+# Intelligent front-panel LED control for the Buffalo WZR-1750DHP (BCM4708).
+#
+# Hardware (all on gpiochip3, the 74hc595 shift register):
+#   red:power      white:power      (power LED, bicolour)
+#   blue:router    amber:router     (router/mode LED, bicolour)
+#   blue:wireless  amber:wireless   (wireless LED, bicolour)
+#   blue:wan                        (internet LED)
+#   blue:usb                        (USB LED)
+#
+# There is no separate "white:internet" or "movie_engine"/logo LED on this
+# board, so the mapping chosen here is:
+#   * the bicolour power LED     -> bring-up / ready (amber-blink / white)
+#   * the bicolour wireless LED  -> dual-band (blue) / single-band (amber)
+#   * blue:wan + amber:router    -> Internet up (blue netdev) / down (amber)
+#   * blue:usb                   -> usbport trigger
+#   * blue:router                -> router-mode / AP-mode indicator (and the
+#                                   nearest equivalent of the Buffalo logo LED,
+#                                   which this model does not have)
+#
+# Kernel triggers (netdev, usbport, timer) do all the real work, so this is
+# zero-CPU in steady state: it only rewrites trigger files on state changes.
+
+LED_BASE="/sys/class/leds"
+
+PWR_RED="bcm53xx:red:power"
+PWR_WHITE="bcm53xx:white:power"
+RTR_BLUE="bcm53xx:blue:router"
+RTR_AMBER="bcm53xx:amber:router"
+WLAN_BLUE="bcm53xx:blue:wireless"
+WLAN_AMBER="bcm53xx:amber:wireless"
+WAN_BLUE="bcm53xx:blue:wan"
+USB_BLUE="bcm53xx:blue:usb"
+
+WL0="wl0"	# 5 GHz
+WL1="wl1"	# 2.4 GHz
+WAN="wan"
+
+log() { [ -n "$BCW_LED_DEBUG" ] && logger -t broadcom-wl-leds "$@"; return 0; }
+
+_set() {
+	[ -d "$LED_BASE/$1" ] || return 0
+	echo "$2" > "$LED_BASE/$1/$3" 2>/dev/null
+}
+
+trig_none() { _set "$1" none trigger; }
+trig_on()   { _set "$1" default-on trigger; }
+br_on()     { _set "$1" 1 brightness; }
+br_off()    { _set "$1" 0 brightness; }
+
+trig_timer() {
+	local led="$1" on="$2" off="$3"
+	[ -d "$LED_BASE/$led" ] || return 0
+	echo timer > "$LED_BASE/$led/trigger" 2>/dev/null
+	echo "$on"  > "$LED_BASE/$led/delay_on" 2>/dev/null
+	echo "$off" > "$LED_BASE/$led/delay_off" 2>/dev/null
+}
+
+trig_netdev() {
+	local led="$1" dev="$2"
+	[ -d "$LED_BASE/$led" ] && [ -n "$dev" ] || return 0
+	echo netdev > "$LED_BASE/$led/trigger" 2>/dev/null
+	# device_name (and the link/tx/rx bits) only exist once the trigger is
+	# netdev, so re-check before every write: an early boot call where the
+	# trigger module is not up yet must not spew EACCES from the shell.
+	[ -e "$LED_BASE/$led/device_name" ] || return 0
+	echo "$dev" > "$LED_BASE/$led/device_name" 2>/dev/null
+	# Kernel 5.1+ dropped the combined 'mode' attribute in favour of separate
+	# link/tx/rx booleans; support both so the script is kernel-agnostic.
+	if [ -e "$LED_BASE/$led/mode" ]; then
+		echo "link tx rx" > "$LED_BASE/$led/mode" 2>/dev/null
+	else
+		for _b in link tx rx; do
+			[ -e "$LED_BASE/$led/$_b" ] && \
+				echo 1 > "$LED_BASE/$led/$_b" 2>/dev/null
+		done
+	fi
+}
+
+iface_present() { [ -d "/sys/class/net/$1" ]; }
+iface_up() {
+	iface_present "$1" || return 1
+	local f; f="$(cat "/sys/class/net/$1/flags" 2>/dev/null)"
+	[ -n "$f" ] && [ $((f & 0x1)) -eq 1 ] 2>/dev/null
+}
+iface_carrier() {
+	iface_present "$1" || return 1
+	[ "$(cat "/sys/class/net/$1/carrier" 2>/dev/null)" = "1" ]
+}
+has_default_route() {
+	ip -4 route show default 2>/dev/null | grep -q . || \
+	ip -6 route show default 2>/dev/null | grep -q .
+}
+
+# Count radios that are UP. wl0/wl1 exist only once the blob radio is up.
+radios_up() {
+	local n=0
+	iface_up "$WL0" && n=$((n + 1))
+	iface_up "$WL1" && n=$((n + 1))
+	echo $n
+}
+
+# --- Power: amber blink during bring-up, solid white once radios are up ----
+power_update() {
+	local n; n="$(radios_up)"
+	if [ "$n" -eq 2 ]; then
+		trig_none "$PWR_RED"; br_off "$PWR_RED"
+		trig_on "$PWR_WHITE"; br_on "$PWR_WHITE"
+	else
+		trig_none "$PWR_WHITE"; br_off "$PWR_WHITE"
+		trig_timer "$PWR_RED" 500 500
+	fi
+}
+
+# --- Wireless: both bands = blue netdev (traffic blink); one = amber -------
+wireless_update() {
+	local n; n="$(radios_up)"
+	if [ "$n" -eq 2 ]; then
+		trig_none "$WLAN_AMBER"; br_off "$WLAN_AMBER"
+		trig_netdev "$WLAN_BLUE" "$WL0"
+	elif [ "$n" -eq 1 ]; then
+		trig_none "$WLAN_BLUE"; br_off "$WLAN_BLUE"
+		if iface_up "$WL0"; then
+			trig_netdev "$WLAN_AMBER" "$WL0"
+		else
+			trig_netdev "$WLAN_AMBER" "$WL1"
+		fi
+	else
+		trig_none "$WLAN_BLUE";   br_off "$WLAN_BLUE"
+		trig_none "$WLAN_AMBER"; br_off "$WLAN_AMBER"
+	fi
+}
+
+# --- Internet: blue netdev on wan up+route; amber router solid otherwise ---
+internet_update() {
+	if iface_up "$WAN" && iface_carrier "$WAN" && has_default_route; then
+		trig_none "$RTR_AMBER"; br_off "$RTR_AMBER"
+		trig_netdev "$WAN_BLUE" "$WAN"
+	else
+		trig_none "$WAN_BLUE"; br_off "$WAN_BLUE"
+		trig_on "$RTR_AMBER"; br_on "$RTR_AMBER"
+	fi
+}
+
+usb_update() { _set "$USB_BLUE" usbport trigger; }
+
+update_all() {
+	power_update
+	wireless_update
+	internet_update
+	usb_update
+}
+
+# blink-amber N: quick visual ack on the wireless amber LED, then re-apply.
+blink_amber() {
+	local n="${1:-3}"
+	[ -d "$LED_BASE/$WLAN_AMBER" ] || return 0
+	echo timer > "$LED_BASE/$WLAN_AMBER/trigger" 2>/dev/null
+	echo 150 > "$LED_BASE/$WLAN_AMBER/delay_on" 2>/dev/null
+	echo 150 > "$LED_BASE/$WLAN_AMBER/delay_off" 2>/dev/null
+	# busybox sleep is integer-only here; give it ~n*0.3s rounded to >=1s.
+	local s=$(( (n + 3) / 4 ))
+	[ "$s" -lt 1 ] && s=1
+	sleep "$s"
+	wireless_update
+}
+
+case "$1" in
+init|start|apply)	update_all ;;
+power)			power_update ;;
+wireless|wifi)		wireless_update ;;
+internet|wan)		internet_update ;;
+usb)			usb_update ;;
+blink-amber)		shift; blink_amber "$@" ;;
+*)			update_all ;;
+esac
+
+exit 0

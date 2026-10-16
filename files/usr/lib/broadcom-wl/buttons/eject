@@ -1,0 +1,34 @@
+#!/bin/sh
+#
+# USB Eject button (gpio 15). Syncs and unmounts any mounted USB storage
+# partitions, blinks the USB LED three times, then leaves the usbport trigger
+# in charge again. Nothing is powered off - only unmounted - so yanking the
+# cable afterwards is safe.
+
+USB_LED="/sys/class/leds/bcm53xx:blue:usb"
+
+blink_usb() {
+	[ -d "$USB_LED" ] || return 0
+	echo timer > "$USB_LED/trigger" 2>/dev/null
+	echo 150 > "$USB_LED/delay_on" 2>/dev/null
+	echo 150 > "$USB_LED/delay_off" 2>/dev/null
+	sleep 1
+	echo usbport > "$USB_LED/trigger" 2>/dev/null
+}
+
+case "$ACTION" in
+released)
+	sync
+	# Unmount every mounted /dev/sd* partition (usb-storage uses sd*).
+	for m in $(awk '$1 ~ /^\/dev\/sd/ { print $2 }' /proc/mounts); do
+		umount "$m" 2>/dev/null && \
+			logger -t broadcom-wl-button "eject: unmounted $m"
+	done
+	# Drop USB block device caches so the LED/state settle.
+	blockdev --flushbufs /dev/sd* >/dev/null 2>&1
+	blink_usb
+	return 0
+	;;
+esac
+
+return 0

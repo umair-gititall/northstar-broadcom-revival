@@ -26,6 +26,15 @@ NVRAM_DIR="${NVRAM_DIR:-/firmadyne/libnvram}"
 NVRAM_OVERRIDE_DIR="${NVRAM_OVERRIDE_DIR:-/firmadyne/libnvram.override}"
 BCW_RUNDIR="${BCW_RUNDIR:-/var/run/broadcom-wl}"
 
+# Refresh the intelligent front-panel LEDs (see /usr/sbin/broadcom-wl-leds).
+# Fire-and-forget so radio bring-up never waits on the LED pass, and silent if
+# the helper is absent (e.g. a build without the LED files).
+bcw_leds() {
+	[ -x /usr/sbin/broadcom-wl-leds ] || return 0
+	/usr/sbin/broadcom-wl-leds "${1:-apply}" >/dev/null 2>&1 &
+	return 0
+}
+
 # ---------------------------------------------------------------------------
 # NVRAM store
 # ---------------------------------------------------------------------------
@@ -389,6 +398,7 @@ bcw_radio_up() {
 	# handler reports it via set_vif(); it does not set IFF_UP itself, so the
 	# port never joins br-lan and no traffic flows. Bring it up here.
 	ip link set "$_ifname" up
+	bcw_leds apply
 }
 
 bcw_radio_down() {
@@ -464,6 +474,8 @@ bcw_security_start() {
 	# healthy daemon from one whose packet socket went stale (bridge
 	# replaced, hence a new ifindex, or lan_ifname rewritten underneath it).
 	bcw_daemon_mark "$_bridge"
+
+	bcw_leds apply
 }
 
 bcw_security_stop() {
@@ -641,11 +653,11 @@ bcw_security_ensure() {
 		bcw_security_stop
 	fi
 
- 	bcw_security_start "$_bridge"
- 	return 0
- }
+	bcw_security_start "$_bridge"
+	return 0
+}
 
- # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Defaults seeded once, from the init script
 # ---------------------------------------------------------------------------
 

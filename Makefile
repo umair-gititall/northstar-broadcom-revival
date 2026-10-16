@@ -3,7 +3,7 @@ include $(INCLUDE_DIR)/kernel.mk
 
 PKG_NAME:=broadcom-wl
 PKG_VERSION:=6.37.14.126
-PKG_RELEASE:=1
+PKG_RELEASE:=3
 
 PKG_LICENSE:=Proprietary
 PKG_LICENSE_FILES:=vendor/README.md
@@ -101,6 +101,11 @@ define Build/Compile
 	# The wl-enabled libiwinfo. Built last, standalone: it needs nothing from
 	# the rest of the tree and only links against libc (see iwinfo/Makefile).
 	+$(MAKE) -C $(PKG_BUILD_DIR)/iwinfo CC="$(TARGET_CC)" CFLAGS="$(TARGET_CFLAGS)"
+	# The userspace button/switch daemon. Single TU, libc only; exists because
+	# the stock gpio-button-hotplug module rejects this board's DT key node
+	# (unsupported KEY_SETUP) and kills every button. See userspace/buttond.
+	+$(MAKE) -C $(PKG_BUILD_DIR)/userspace/buttond \
+		CC="$(TARGET_CC)" CFLAGS="$(TARGET_CFLAGS)"
 endef
 
 define Package/broadcom-wl/install
@@ -110,6 +115,8 @@ define Package/broadcom-wl/install
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/userspace/eapd/eapd $(1)/usr/sbin/eapd
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/userspace/nas/nas $(1)/usr/sbin/nas
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/userspace/uclibc-compat/wl $(1)/usr/sbin/wl
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/userspace/buttond/broadcom-wl-buttond \
+		$(1)/usr/sbin/broadcom-wl-buttond
 	$(INSTALL_DATA) $(PKG_BUILD_DIR)/vendor/libnvram/libnvram.so $(1)/usr/lib/libnvram.so
 	$(INSTALL_DATA) $(PKG_BUILD_DIR)/vendor/libshared/libshared.so $(1)/usr/lib/libshared.so
 
@@ -137,11 +144,27 @@ define Package/broadcom-wl/install
 	$(INSTALL_DIR) $(1)/usr/lib/broadcom-wl $(1)/lib/netifd/wireless
 	$(INSTALL_DIR) $(1)/etc/init.d $(1)/etc/hotplug.d/iface $(1)/etc/uci-defaults
 	$(INSTALL_BIN) ./files/usr/sbin/broadcom-wl-ctl $(1)/usr/sbin/broadcom-wl-ctl
+	$(INSTALL_BIN) ./files/usr/sbin/broadcom-wl-leds $(1)/usr/sbin/broadcom-wl-leds
 	$(INSTALL_BIN) ./files/usr/lib/broadcom-wl/common.sh $(1)/usr/lib/broadcom-wl/common.sh
 	$(INSTALL_BIN) ./files/lib/netifd/wireless/broadcom.sh $(1)/lib/netifd/wireless/broadcom.sh
 	$(INSTALL_BIN) ./files/etc/init.d/broadcom-wl $(1)/etc/init.d/broadcom-wl
+	$(INSTALL_BIN) ./files/etc/init.d/broadcom-wl-leds $(1)/etc/init.d/broadcom-wl-leds
+	$(INSTALL_BIN) ./files/etc/init.d/broadcom-wl-buttond $(1)/etc/init.d/broadcom-wl-buttond
 	$(INSTALL_BIN) ./files/etc/hotplug.d/iface/30-broadcom-wl $(1)/etc/hotplug.d/iface/30-broadcom-wl
+	$(INSTALL_BIN) ./files/etc/hotplug.d/iface/31-broadcom-wl-leds $(1)/etc/hotplug.d/iface/31-broadcom-wl-leds
 	$(INSTALL_BIN) ./files/etc/uci-defaults/99-broadcom-wl $(1)/etc/uci-defaults/99-broadcom-wl
+
+	# Button scripts. These live under /usr/lib/broadcom-wl/buttons (buttond's
+	# first search dir) and deliberately NOT in /etc/rc.button: reset/rfkill
+	# there are owned by base-files and wps by wifi-scripts, so claiming them
+	# would make this package uninstallable. buttond tries our dir first, then
+	# falls back to /etc/rc.button for anything we do not ship.
+	$(INSTALL_DIR) $(1)/usr/lib/broadcom-wl/buttons
+	$(INSTALL_BIN) ./files/usr/lib/broadcom-wl/buttons/reset $(1)/usr/lib/broadcom-wl/buttons/reset
+	$(INSTALL_BIN) ./files/usr/lib/broadcom-wl/buttons/wps $(1)/usr/lib/broadcom-wl/buttons/wps
+	$(INSTALL_BIN) ./files/usr/lib/broadcom-wl/buttons/eject $(1)/usr/lib/broadcom-wl/buttons/eject
+	$(INSTALL_BIN) ./files/usr/lib/broadcom-wl/buttons/mode $(1)/usr/lib/broadcom-wl/buttons/mode
+	$(INSTALL_BIN) ./files/usr/lib/broadcom-wl/buttons/ap $(1)/usr/lib/broadcom-wl/buttons/ap
 endef
 
 define Package/broadcom-wl/postinst
@@ -155,6 +178,12 @@ define Package/broadcom-wl/postinst
 	# can describe the radios. Also re-asserted from init.d at every boot, in
 	# case a libiwinfo package upgrade clobbers the symlink.
 	[ -x /usr/sbin/broadcom-wl-ctl ] && /usr/sbin/broadcom-wl-ctl iwinfo-install 2>/dev/null
+
+	# Enable the new services. broadcom-wl itself is already enabled in the
+	# firmware image, but an apk-installed script gets no rc.d symlink for
+	# free, so create them here (idempotent).
+	[ -x /etc/init.d/broadcom-wl-leds ] && /etc/init.d/broadcom-wl-leds enable 2>/dev/null
+	[ -x /etc/init.d/broadcom-wl-buttond ] && /etc/init.d/broadcom-wl-buttond enable 2>/dev/null
 
 	# A freshly installed driver is inert until the next boot: netifd reads
 	# /etc/config/wireless once at startup, before wl.ko claims the radios, so
@@ -175,6 +204,8 @@ endef
 define Package/broadcom-wl/prerm
 #!/bin/sh
 [ -n "$${IPKG_INSTROOT}" ] || {
+	[ -x /etc/init.d/broadcom-wl-buttond ] && /etc/init.d/broadcom-wl-buttond disable 2>/dev/null
+	[ -x /etc/init.d/broadcom-wl-leds ] && /etc/init.d/broadcom-wl-leds disable 2>/dev/null
 	[ -x /usr/sbin/broadcom-wl-ctl ] && /usr/sbin/broadcom-wl-ctl iwinfo-restore 2>/dev/null
 	/usr/sbin/broadcom-wl-ctl handler-restore 2>/dev/null
 }
