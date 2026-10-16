@@ -327,64 +327,58 @@ LED and five-button behaviour; install it on an unknown Northstar board and the
 Wi-Fi LEDs still light up out-of-the-box, while the buttons are left to the
 kernel's own hotplug driver.
 
-## Installation
+## Build & Install
 
-This repository does **not** ship packages in upstream OpenWrt feeds. Build the APKs from source, then install them locally on your router.
+This repository does **not** ship packages in upstream OpenWrt feeds. Build the APKs from source using the OpenWrt SDK, then install them on your router.
 
-**Installing built APKs:**
+### 1. Get the OpenWrt SDK
+Use OpenWrt 25.12.5 for `bcm53xx/generic` with GCC 14.3.0 musl eabi. Example SDK filename:
+```
+openwrt-sdk-25.12.5-bcm53xx-generic_gcc-14.3.0_musl_eabi.Linux-x86_64.tar.xz
+```
+Extract it and `cd` into the SDK root.
 
-1. Copy both packages to the router (Dropbear on stock OpenWrt lacks `sftp-server`, so `scp` may fail — use the pipe method below):
+### 2. Clone this repo into the SDK package directory
 ```sh
-for f in kmod-broadcom-wl-*.apk broadcom-wl-*.apk; do
-  cat "$f" | ssh root@192.168.1.1 "cat > /tmp/$(basename "$f")"
+mkdir -p package
+git clone https://github.com/umair-gititall/northstar-broadcom-revival.git package/broadcom-wl
+cd package/broadcom-wl
+```
+
+### 3. Fetch vendor blobs
+```sh
+./fetch.sh
+```
+This downloads `wl_apsta.o` and the prebuilt `wl` tool from FreshTomato (pinned revision) and verifies sha256sums against `sha256sums.txt`.
+
+### 4. Build the APKs
+```sh
+cd ../..
+make package/broadcom-wl/clean
+make package/broadcom-wl/compile V=s
+make package/broadcom-wl/package/index V=s
+```
+APKs will be at:
+```
+bin/packages/arm_cortex-a9_vfpv3-d16/base/kmod-broadcom-wl-6.12.94.6.37.14.126-r6.apk
+bin/packages/arm_cortex-a9_vfpv3-d16/base/broadcom-wl-6.37.14.126-r6.apk
+```
+(Release number may vary slightly; use the exact filenames produced.)
+
+### 5. Copy to router
+Stock OpenWrt (Dropbear) lacks `sftp-server`, so `scp` may fail. Use this method instead:
+```sh
+for f in bin/packages/arm_cortex-a9_vfpv3-d16/base/kmod-broadcom-wl-*.apk bin/packages/arm_cortex-a9_vfpv3-d16/base/broadcom-wl-*.apk; do
+  [ -f "$f" ] && cat "$f" | ssh root@192.168.1.1 "cat > /tmp/$(basename "$f")"
 done
 ```
-(If your SSH client supports the legacy SCP protocol, `scp -O ...` may also work. If using a custom SSH config, pass `-F <config>` to `ssh`.)
+If your SSH client supports legacy SCP, `scp -O ...` can work too. Pass `-F <config>` to `ssh/scp` if using a custom config.
 
-2. Install them locally:
+### 6. Install and reboot
 ```sh
 ssh root@192.168.1.1 "apk add --allow-untrusted /tmp/kmod-broadcom-wl-*.apk /tmp/broadcom-wl-*.apk"
 ```
-
-`broadcom-wl` is the userspace and OpenWrt glue; `kmod-broadcom-wl` is the kernel module. They move together.
-
-The userspace package's `postinst` triggers a **one-time automatic reboot** once both packages are in place. netifd reads `/etc/config/wireless` only at startup, before `wl.ko` has claimed the radios; without the reboot, wireless daemons start under the stock no-driver view and may not properly initialize until the next boot. The reboot is deferred and detached so `apk` finishes and reports success first — **wait for the router to come back up before configuring Wi-Fi**.
-
-### The stock-kernel radio handover
-
-Stock OpenWrt builds bcma with `CONFIG_BCMA_HOST_PCI=y`, so the built-in
-`bcma-pci-bridge` driver claims the radios (`14e4:4331`, `14e4:43a0`) at boot,
-and `b43` attaches. To hand them to `wl`, the init script:
-
-1. `rmmod b43` (its `remove()` cascades through the bcma bus),
-2. for each bound BDF, `echo <BDF> > /sys/bus/pci/drivers/bcma-pci-bridge/unbind`,
-3. `insmod /lib/modules/$(uname -r)/wl.ko intf_name=wl%d`.
-
-Registering `wl`'s own PCI driver re-attaches the now-free radios. This is the
-whole reason no reflash is needed — the clean alternative is a custom kernel
-with `CONFIG_BCMA_HOST_PCI` off, which this port does not require.
-
-### Configuring
-
-After install, `/etc/config/wireless` gets two `wifi-device` sections of
-`option type 'broadcom'` (radio0 = 2.4 GHz, radio1 = 5 GHz) and matching
-`wifi-iface` sections. They start disabled; enable and edit in LuCI, or:
-
-```sh
-uci set wireless.radio1.disabled=0
-uci set wireless.default_radio1.ssid='my-net'
-uci set wireless.default_radio1.encryption='psk2'
-uci set wireless.default_radio1.key='secret'
-uci commit wireless && wifi reload
-```
-
-`wifi` starts the netifd handler, which applies the config and starts the
-security daemons. `wldiag` prints the driver's view if anything looks wrong:
-
-```sh
-wldiag wl0            # full state dump
-wldiag wl1 iovar mbss # one query
-```
+The userspace package's `postinst` triggers a **one-time automatic reboot** once both packages are in place (netifd needs `wl.ko` loaded at startup to see the radios). Wait for the router to come back up before configuring Wi-Fi.
 
 ## Running the prebuilt `wl` on musl
 
@@ -526,59 +520,6 @@ vendor's published source at a pinned, sha256-verified revision:
 ```
 
 The resulting `wl.ko` taints the kernel, which is correct and expected.
-
-## Building from source
-
-There are two ways to build this package. The recommended path for OpenWrt targets is inside an OpenWrt SDK.
-
-### Option 1: Build inside the OpenWrt SDK (recommended)
-
-The exact workflow used for the verified builds in this repository:
-
-1. **Get an OpenWrt SDK for bcm53xx/generic (25.12.5)** — e.g. `openwrt-sdk-25.12.5-bcm53xx-generic_gcc-14.3.0_musl_eabi.Linux-x86_64.tar.xz`.
-
-2. **Clone this repository into the SDK's package directory** (or symlink it). The SDK's `make` will discover `package/broadcom-wl/Makefile`:
-```sh
-cd /path/to/openwrt-sdk-25.12.5-bcm53xx-generic_*
-mkdir -p package
-git clone https://github.com/umair-gititall/northstar-broadcom-revival.git package/broadcom-wl
-cd package/broadcom-wl
-```
-
-3. **Fetch vendor blobs and verify sha256sums**:
-```sh
-./fetch.sh
-```
-This downloads `wl_apsta.o` and the prebuilt `wl` tool from FreshTomato (pinned revision) and verifies them against `sha256sums.txt`.
-
-4. **Compile and package the APKs**:
-```sh
-cd ../..  # back to SDK root
-make package/broadcom-wl/clean
-make package/broadcom-wl/compile V=s
-make package/broadcom-wl/package/index V=s
-```
-
-After a successful build, the SDK places the APKs in:
-- `bin/packages/arm_cortex-a9_vfpv3-d16/base/kmod-broadcom-wl-<kver>.<drvver>-r<release>.apk`
-- `bin/packages/arm_cortex-a9_vfpv3-d16/base/broadcom-wl-<drvver>-r<release>.apk`
-
-For example, the verified r6 build produced:
-- `kmod-broadcom-wl-6.12.94.6.37.14.126-r6.apk`
-- `broadcom-wl-6.37.14.126-r6.apk`
-
-Copy these to your router and install as shown in [Installation](#installation).
-
-### Option 2: Build standalone (kernel/userspace outside SDK)
-
-For users building against a separate kernel tree (e.g. for testing):
-```sh
-./fetch.sh
-make -f Makefile.standalone OBJCOPY=<cross-objcopy> wl_apsta.o_shipped
-make -C <linux-6.12-tree> M=$PWD ARCH=arm CROSS_COMPILE=<abs-path>- modules
-make -f Makefile.standalone userspace CROSS_COMPILE=<abs-path>-
-```
-`CROSS_COMPILE` must be absolute — the kernel `cd`s during the build.
 
 ## Credits
 
