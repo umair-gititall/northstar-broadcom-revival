@@ -24,10 +24,54 @@
 #include "iwinfo.h"
 #include "api/broadcom.h"
 
+/*
+ * LuCI (and rpcd-mod-luci) address a radio by its UCI wifi-device section name
+ * (radio0, radio1), not by its netdev. The nl80211 backend handles this by
+ * resolving the section through its uci `path' option (nl80211_phy_idx_from_uci);
+ * the wl driver has no such option, so the netifd handler records the runtime
+ * section -> netdev mapping (band order is PCI probe order and must not be
+ * assumed) under /var/run/broadcom-wl. Translate a section name here so that a
+ * call carrying one, like the frequency widget's `iwinfo freqlist', reaches the
+ * right wl<N>.
+ */
+static const char *wl_resolve(const char *ifname)
+{
+	static char netdev[IFNAMSIZ];
+	char path[128];
+	FILE *f;
+	size_t len;
+
+	/* A real netdev (wl0, wl0.1, ...) needs no translation. */
+	if (if_nametoindex(ifname) > 0)
+		return ifname;
+
+	snprintf(path, sizeof(path), "/var/run/broadcom-wl/%s.ifname", ifname);
+
+	if ((f = fopen(path, "r")) == NULL)
+		return ifname;
+
+	if (fgets(netdev, sizeof(netdev), f) == NULL)
+	{
+		fclose(f);
+		return ifname;
+	}
+
+	fclose(f);
+
+	len = strlen(netdev);
+	while (len > 0 && (netdev[len - 1] == '\n' || netdev[len - 1] == '\r' ||
+	                   netdev[len - 1] == ' '  || netdev[len - 1] == '\t'))
+		netdev[--len] = '\0';
+
+	return netdev[0] ? netdev : ifname;
+}
+
 static int wl_ioctl(const char *name, int cmd, void *buf, int len)
 {
 	struct ifreq ifr;
 	wl_ioctl_t ioc;
+
+	name = wl_resolve(name);
 
 	/* do it */
 	ioc.cmd = cmd;
@@ -44,6 +88,8 @@ static int wl_iovar(const char *name, const char *cmd, const char *arg,
 					int arglen, void *buf, int buflen)
 {
 	int cmdlen = strlen(cmd) + 1;
+
+	name = wl_resolve(name);
 
 	memcpy(buf, cmd, cmdlen);
 
@@ -258,11 +304,13 @@ static int wl_get_noise(const char *ifname, int *buf)
 
 static int wl_get_quality(const char *ifname, int *buf)
 {
+	ifname = wl_resolve(ifname);
 	return wext_ops.quality(ifname, buf);
 }
 
 static int wl_get_quality_max(const char *ifname, int *buf)
 {
+	ifname = wl_resolve(ifname);
 	return wext_ops.quality_max(ifname, buf);
 }
 
@@ -350,6 +398,8 @@ static int wl_get_encryption(const char *ifname, char *buf)
 static int wl_get_phyname(const char *ifname, char *buf)
 {
 	char *p;
+
+	ifname = wl_resolve(ifname);
 
 	strcpy(buf, ifname);
 
@@ -456,6 +506,8 @@ static int wl_get_assoclist(const char *ifname, char *buf, int *len)
 	struct iwinfo_assoclist_entry entry;
 	FILE *arp;
 
+	ifname = wl_resolve(ifname);
+
 	ap = infra = passive = 0;
 
 	wl_ioctl(ifname, WLC_GET_AP, &ap, sizeof(ap));
@@ -544,12 +596,55 @@ static int wl_get_txpwrlist(const char *ifname, char *buf, int *len)
 
 static int wl_get_scanlist(const char *ifname, char *buf, int *len)
 {
+	ifname = wl_resolve(ifname);
 	return wext_ops.scanlist(ifname, buf, len);
 }
 
 static int wl_get_freqlist(const char *ifname, char *buf, int *len)
 {
-	return wext_ops.freqlist(ifname, buf, len);
+	uint32_t list[WLC_IOCTL_MAXLEN / sizeof(uint32_t)];
+	struct iwinfo_freqlist_entry *e = (struct iwinfo_freqlist_entry *)buf;
+	int i, count;
+	uint32_t ch;
+
+	ifname = wl_resolve(ifname);
+
+	/*
+	 * WLC_GET_VALID_CHANNELS returns a wl_uint32_list: element[0] is an
+	 * input capacity that must be large enough for the reply, and on return
+	 * holds the count of channel numbers that follow. The driver only
+	 * reports channels legal for the current country and band, which is
+	 * exactly what LuCI's frequency widget needs. The wext fallback this
+	 * used to delegate to always came back empty on wl, which emptied the
+	 * widget's band/channel selectors and made LuCI drop them on save.
+	 */
+	memset(list, 0, sizeof(list));
+	list[0] = ARRAY_SIZE(list) - 1;
+
+	if (wl_ioctl(ifname, WLC_GET_VALID_CHANNELS, list, sizeof(list)))
+		return -1;
+
+	count = (int)list[0];
+	if (count < 0 || count > (int)(ARRAY_SIZE(list) - 1))
+		count = ARRAY_SIZE(list) - 1;
+
+	for (i = 0; i < count; i++)
+	{
+		ch = list[i + 1];
+
+		memset(e, 0, sizeof(*e));
+		e->channel    = (uint8_t)ch;
+		e->band       = (ch <= 14) ? IWINFO_BAND_24 : IWINFO_BAND_5;
+		e->restricted = 0;
+		e->flags      = 0;
+		e->mhz        = (ch == 14) ? 2484 :
+		                (ch <= 14) ? (uint32_t)(2407 + (int)ch * 5) :
+		                             (uint32_t)(5000 + (int)ch * 5);
+		e++;
+	}
+
+	*len = count * (int)sizeof(struct iwinfo_freqlist_entry);
+	return 0;
 }
 
 static int wl_get_country(const char *ifname, char *buf)

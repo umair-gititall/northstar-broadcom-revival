@@ -185,17 +185,29 @@ function setup() {
 	let radio = ARGV[2];
 	let config = data.config;
 
+	let band = resolve_band(config, radio);
+	let ifname = resolve_ifname(band);
+
+	// Record the UCI-section -> netdev mapping for the wl iwinfo backend.
+	// LuCI (and rpcd-mod-luci) address a radio by its section name, but the
+	// driver only knows wl<N>, and the band order is PCI probe order. Write it
+	// even for a disabled radio so its LuCI page still resolves. See
+	// wl_resolve() in iwinfo/iwinfo_wl.c.
+	if (ifname != '') {
+		let mapf = fs.open(`${RUNDIR}/${radio}.ifname`, 'w');
+		mapf.write(`${ifname}\n`);
+		mapf.close();
+	}
+
 	if (config.disabled) {
 		log(`${radio}: disabled`);
 		return 0;
 	}
 
-	let band = resolve_band(config, radio);
 	config.band = band;
 
 	validate('device', config);
 
-	let ifname = resolve_ifname(band);
 	if (ifname == '') {
 		log(`${radio}: no ${band} radio found (is the wl module loaded?)`);
 		netifd.setup_failed(`${radio}: no ${band} radio`);

@@ -48,6 +48,7 @@ ARMv7-A, Thumb-2, soft-float EABI, GCC 4.5.3, driver version
 | `wl` | `/usr/sbin/` | FreshTomato's command-line tool, shipped as their **prebuilt uClibc binary** — they publish no source |
 | `uclibc.so` | `/lib/` | not a libc: the shim that lets that binary run against musl |
 | `libnvram.so`, `libshared.so` | `/usr/lib/` | the NVRAM store the tools share, and Broadcom's shared helpers (`get_wsec()`, `get_ifname_by_wlmac()`, …) |
+| `libiwinfo.so.20230701` | `/usr/lib/broadcom-wl/`, symlinked from `/usr/lib/` | iwinfo built with the `wl` backend, for LuCI (see **LuCI and `libiwinfo`**) |
 
 `libbcmcrypto` is a static archive linked into `nas`; it is not installed.
 
@@ -134,6 +135,46 @@ like `mac80211` ones: SSID, channel/width, country, encryption, and per-radio
 enable. It translates UCI into the `wl<N>_*` NVRAM keys the tools read, drives
 `wlconf`/`eapd`/`nas`, and reports the interfaces back to netifd. The init
 script (`/etc/init.d/broadcom-wl`) owns module load and the radio unbind.
+
+### LuCI and `libiwinfo`
+
+LuCI does not talk to the netifd handler directly: `rpcd-mod-luci` describes the
+radios by `dlopen()`ing `/usr/lib/libiwinfo.so*` and calling its backend-neutral
+API. The stock library is built with the **nl80211** backend only, so on this
+cfg80211-less board every call fails and LuCI shows the radios as
+"Generic / unknown", with no channel, rate or station list. The package
+therefore ships the same iwinfo rebuilt with the Broadcom `wl` backend (plus
+`wext`, which `wl` delegates to a few ops) and points the canonical
+`/usr/lib/libiwinfo.so.20230701` at it, moving the stock file aside as
+`…/broadcom-wl/libiwinfo.so.20230701.stock`; `prerm` puts it back. It cannot be
+installed at the canonical path directly — that file belongs to the stock
+`libiwinfo` package, and a second owner is an apk file conflict — so it lives in
+`/usr/lib/broadcom-wl/` and the init script re-asserts the symlink every boot (§
+`bcw_iwinfo_install`).
+
+Two things make that backend usable from LuCI:
+
+- **Section names.** LuCI addresses a radio by its UCI `wifi-device` section
+  (`radio0`), not by its netdev, and the driver only knows `wl<N>`. The nl80211
+  backend resolves this through its `path` option; here the netifd handler
+  records the section → netdev mapping under
+  `/var/run/broadcom-wl/<radio>.ifname` (the band → netdev order is PCI probe
+  order and must not be assumed), and `wl_resolve()` in `iwinfo_wl.c` consults
+  it. Without it every `iwinfo` call addressed at a section — `info`, not just
+  `freqlist` — fails.
+- **Channel list.** LuCI's frequency widget calls `iwinfo freqlist`; with an
+  empty reply it hides its band/channel selectors, and then LuCI drops band,
+  channel and htmode when the section is saved (which is what once emptied these
+  radios' configs). `wl_get_freqlist()` therefore reports the driver's legal
+  channels via `WLC_GET_VALID_CHANNELS` instead of delegating to wext, which
+  always came back empty on `wl`. The init script's `config-repair` step heals a
+  config that was damaged before the swap.
+
+netifd discovers wireless handlers by globbing `/lib/netifd/wireless/*.sh` and
+its reader loop does not stop at EOF, so with more than one handler present it
+busy-spins at ~100% CPU. Stock ships `mac80211.sh`; the init script moves that
+(and any other handler) aside with `broadcom-wl-ctl handler-single`, leaving
+only `broadcom.sh`, and `prerm` restores it.
 
 ## Installation
 
