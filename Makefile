@@ -3,7 +3,7 @@ include $(INCLUDE_DIR)/kernel.mk
 
 PKG_NAME:=broadcom-wl
 PKG_VERSION:=6.37.14.126
-PKG_RELEASE:=3
+PKG_RELEASE:=6
 
 PKG_LICENSE:=Proprietary
 PKG_LICENSE_FILES:=vendor/README.md

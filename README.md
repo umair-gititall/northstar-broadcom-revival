@@ -285,6 +285,34 @@ claiming them would make this package uninstallable. buttond searches our
 directory first, then falls back to `/etc/rc.button/` for anything we do not
 ship (`failsafe`, `power`, `rfkill`, …).
 
+### Board detection and portability
+
+The LED and button wiring above is specific to the Buffalo WZR-1750DHP, so
+both the LED helper and `buttond` self-gate on the board before they touch any
+hardware, and fall back to safe, generic behaviour elsewhere on `bcm53xx`:
+
+* **`buttond`** reads `/tmp/sysinfo/board_name` (falling back to a match in the
+  NUL-separated `/proc/device-tree/compatible`) and **exits immediately** unless
+  the board is `buffalo,wzr-1750dhp`. The line map it drives (GPIO 11-15) is
+  board-specific — on a different router those lines can be LEDs or USB power
+  rails, and the stock `gpio-button-hotplug` module already probes the buttons
+  cleanly (they do not carry this board's `KEY_SETUP` quirk). The init script
+  performs the same check, and the daemon re-checks as a belt-and-braces guard
+  so a forced start can never drive foreign lines.
+* **`broadcom-wl-leds`** runs the rich 8-LED dual-colour state machine only on
+  the WZR-1750DHP (or whenever its signature `bcm53xx:blue:wireless` LED is
+  present). On any other board it scans `/sys/class/leds` for generic
+  `*5g*`/`*2g*`/`*wlan*`/`*wireless*`/`*wifi*`/`*internet*`/`*wan*` names and
+  binds the `netdev` trigger (`link`/`tx`/`rx`) on the matching radio, resolving
+  band → netdev through `broadcom-wl-ctl ifname <band>` (PCI probe order) rather
+  than assuming a fixed `wl0`/`wl1` order. Nothing in either path writes a GPIO
+  line, so the fallback is always safe.
+
+The upshot: install the package on a known board and you get the full dual-band
+LED and five-button behaviour; install it on an unknown Northstar board and the
+Wi-Fi LEDs still light up out-of-the-box, while the buttons are left to the
+kernel's own hotplug driver.
+
 ## Installation
 
 ### Packages

@@ -3,7 +3,28 @@
 START=50
 USE_PROCD=1
 
+# The GPIO line map broadcom-wl-buttond drives (11-15) is the Buffalo
+# WZR-1750DHP's. On other bcm53xx Northstar routers those lines belong to LEDs
+# or USB power rails, and the stock gpio-button-hotplug module already probes
+# the buttons cleanly (they do not carry this board's KEY_SETUP quirk). So
+# only launch the daemon on the board it was measured for; elsewhere we start
+# nothing and leave the hardware to the kernel.
+is_wzr1750dhp() {
+	local board=""
+	[ -r /tmp/sysinfo/board_name ] && board="$(cat /tmp/sysinfo/board_name 2>/dev/null)"
+	case "$board" in
+	*wzr-1750dhp*) return 0 ;;
+	esac
+	# Early-boot fallback: match the DT compatible list (NUL-separated).
+	grep -qa "wzr-1750dhp" /proc/device-tree/compatible 2>/dev/null
+}
+
 start_service() {
+	if ! is_wzr1750dhp; then
+		logger -t broadcom-wl-buttond \
+			"board is not a Buffalo WZR-1750DHP; leaving buttons to the kernel"
+		return 0
+	fi
 	[ -x /usr/sbin/broadcom-wl-buttond ] || return 0
 	procd_open_instance
 	procd_set_param command /usr/sbin/broadcom-wl-buttond

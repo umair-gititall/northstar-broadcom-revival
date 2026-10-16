@@ -1,8 +1,16 @@
 #!/bin/sh
 #
-# Intelligent front-panel LED control for the Buffalo WZR-1750DHP (BCM4708).
+# Intelligent front-panel LED control for the Buffalo WZR-1750DHP (BCM4708),
+# with a portable fallback for other bcm53xx Northstar routers.
 #
-# Hardware (all on gpiochip3, the 74hc595 shift register):
+# Board detection: on the WZR-1750DHP (or whenever its signature blue:wireless
+# LED is present) the rich 8-LED dual-colour state machine below runs. On any
+# other board the script scans /sys/class/leds for generic wireless/internet
+# LED names and binds the netdev trigger on the right radio, so Wi-Fi LEDs work
+# out-of-the-box on Netgear R7000 / Asus RT-AC68U-class devices too. It never
+# touches a GPIO line, so the fallback is always safe.
+#
+# WZR-1750DHP hardware (all on gpiochip3, the 74hc595 shift register):
 #   red:power      white:power      (power LED, bicolour)
 #   blue:router    amber:router     (router/mode LED, bicolour)
 #   blue:wireless  amber:wireless   (wireless LED, bicolour)
@@ -38,6 +46,33 @@ WL1="wl1"	# 2.4 GHz
 WAN="wan"
 
 log() { [ -n "$BCW_LED_DEBUG" ] && logger -t broadcom-wl-leds "$@"; return 0; }
+
+# --- Board detection --------------------------------------------------------
+# The 8-LED names above are the Buffalo WZR-1750DHP's. On other bcm53xx
+# Northstar routers (Netgear R7000, Asus RT-AC68U, ...) the LED names differ,
+# so we fall back to generic auto-discovery (below) rather than drive the
+# wrong (or nonexistent) LEDs. Nothing here ever touches a GPIO line, so the
+# fallback is always safe.
+
+board_is_wzr1750() {
+	local buf=""
+	[ -r /tmp/sysinfo/board_name ] && \
+		buf="$(cat /tmp/sysinfo/board_name 2>/dev/null)"
+	case "$buf" in
+	*wzr-1750dhp*) return 0 ;;
+	esac
+	# Early-boot fallback: the DT compatible list is NUL-separated, so grep
+	# over the raw file (grep -a treats the NULs as text).
+	grep -qa "wzr-1750dhp" /proc/device-tree/compatible 2>/dev/null
+}
+
+# Use the rich WZR-1750DHP state machine when we are on that board, or when
+# its signature LED (blue:wireless) is present regardless of board name.
+use_rich() {
+	board_is_wzr1750 && return 0
+	[ -d "$LED_BASE/bcm53xx:blue:wireless" ] && return 0
+	return 1
+}
 
 _set() {
 	[ -d "$LED_BASE/$1" ] || return 0
@@ -166,14 +201,79 @@ blink_amber() {
 	wireless_update
 }
 
+# --- Generic Northstar fallback ---------------------------------------------
+# On a board whose LED names we do not know (R7000, RT-AC68U, ...), scan
+# /sys/class/leds for wireless/internet LED names and bind the netdev trigger
+# on the right radio, so Wi-Fi LEDs work out-of-the-box without a per-board
+# table. Band -> netdev is resolved through broadcom-wl-ctl (PCI probe order),
+# never assumed.
+
+band_ifname() {
+	local ifn=""
+	[ -x /usr/sbin/broadcom-wl-ctl ] && \
+		ifn="$(/usr/sbin/broadcom-wl-ctl ifname "$1" 2>/dev/null)"
+	if [ -n "$ifn" ] && iface_present "$ifn"; then
+		echo "$ifn"
+		return 0
+	fi
+	# Fallback before the module is up: the 5GHz radio enumerates first on
+	# the reference board (wl0=5G, wl1=2.4G).
+	if [ "$1" = "5g" ]; then
+		iface_present wl0 && { echo wl0; return 0; }
+		iface_present wl1 && { echo wl1; return 0; }
+	else
+		iface_present wl1 && { echo wl1; return 0; }
+		iface_present wl0 && { echo wl0; return 0; }
+	fi
+	return 1
+}
+
+# Bind every LED whose name looks wireless to its band's radio (netdev trigger),
+# and any internet/wan LED to the wan interface. Names are lower-cased and
+# matched by substring, so bcm53xx:blue:5g, *wlan0*, *wifi*, etc. all work.
+generic_update() {
+	local w5 w2 led name lower
+	w5="$(band_ifname 5g)"
+	w2="$(band_ifname 2g)"
+
+	for led in "$LED_BASE"/*; do
+		[ -d "$led" ] || continue
+		name="$(basename "$led")"
+		lower="$(echo "$name" | tr 'A-Z' 'a-z')"
+		case "$lower" in
+		*5g*|*5ghz*)
+			trig_netdev "$name" "$w5" ;;
+		*2g*|*2.4*|*24g*|*11g*)
+			trig_netdev "$name" "$w2" ;;
+		*wlan*|*wireless*|*wifi*)
+			# Band-agnostic wireless LED: bind to 5 GHz if present.
+			if [ -n "$w5" ]; then
+				trig_netdev "$name" "$w5"
+			elif [ -n "$w2" ]; then
+				trig_netdev "$name" "$w2"
+			fi ;;
+		*internet*|*wan*)
+			trig_netdev "$name" "$WAN" ;;
+		esac
+	done
+}
+
+apply_all() {
+	if use_rich; then
+		update_all
+	else
+		generic_update
+	fi
+}
+
 case "$1" in
-init|start|apply)	update_all ;;
+init|start|apply)	apply_all ;;
 power)			power_update ;;
 wireless|wifi)		wireless_update ;;
 internet|wan)		internet_update ;;
 usb)			usb_update ;;
 blink-amber)		shift; blink_amber "$@" ;;
-*)			update_all ;;
+*)			apply_all ;;
 esac
 
 exit 0

@@ -284,6 +284,42 @@ static int setup_all(void)
 	return ok;
 }
 
+/* True only on the Buffalo WZR-1750DHP. The GPIO line map above (11-15) is
+ * board-specific; on any other bcm53xx Northstar router those lines belong to
+ * LEDs or USB power rails, and stock gpio-button-hotplug already probes the
+ * buttons cleanly (they do not carry this board's KEY_SETUP quirk). Touching
+ * foreign lines could damage hardware, so the daemon self-gates and exits
+ * without exporting anything unless we are on the supported board.
+ *
+ * OpenWrt publishes the board name in /tmp/sysinfo/board_name (e.g.
+ * "buffalo,wzr-1750dhp"); we also accept a match anywhere in the DT
+ * /proc/device-tree/compatible list (NUL-separated) as an early-boot fallback. */
+static int board_is_wzr1750(void)
+{
+	char buf[512];
+	size_t n;
+	FILE *f;
+
+	f = fopen("/tmp/sysinfo/board_name", "r");
+	if (f) {
+		n = fread(buf, 1, sizeof(buf) - 1, f);
+		fclose(f);
+		buf[n] = '\0';
+		if (strstr(buf, "wzr-1750dhp") != NULL)
+			return 1;
+	}
+
+	f = fopen("/proc/device-tree/compatible", "r");
+	if (f) {
+		n = fread(buf, 1, sizeof(buf) - 1, f);
+		fclose(f);
+		buf[n] = '\0';
+		if (n > 0 && strstr(buf, "wzr-1750dhp") != NULL)
+			return 1;
+	}
+	return 0;
+}
+
 int main(void)
 {
 	struct sigaction sa;
@@ -294,11 +330,27 @@ int main(void)
 	sigaction(SIGTERM, &sa, NULL);
 	sigaction(SIGINT, &sa, NULL);
 
-	/* Non-WZR platform: the controller is absent, nothing to do. */
-	if (access(GPIODIR, F_OK) != 0)
+	/* Refuse to run anywhere but the board this GPIO map was measured on.
+	 * (The init script gates on the board too; this is the belt that keeps
+	 * a stale/forced start from ever driving foreign lines.) */
+	if (!board_is_wzr1750()) {
+		fprintf(stderr, "broadcom-wl-buttond: board is not a Buffalo "
+			"WZR-1750DHP (see /tmp/sysinfo/board_name); the GPIO "
+			"button map is board-specific, not starting\n");
 		return 0;
-	if (setup_all() == 0)
+	}
+
+	/* The controller is absent on a platform we do not recognise. */
+	if (access(GPIODIR, F_OK) != 0) {
+		fprintf(stderr, "broadcom-wl-buttond: %s not present; not starting\n",
+			GPIODIR);
 		return 0;
+	}
+	if (setup_all() == 0) {
+		fprintf(stderr, "broadcom-wl-buttond: no button lines could be "
+			"set up; not starting\n");
+		return 0;
+	}
 
 	/* The state file lives under the run dir shared with common.sh. */
 	mkdir("/var/run/broadcom-wl", 0755);
