@@ -564,13 +564,41 @@ bcw_iwinfo_restore() {
 # the netifd handler). With the wl-enabled libiwinfo installed this no longer
 # happens, but a config already damaged in the field has to be healed once.
 #
-# Only touches broadcom wifi-device sections that have neither band nor hwmode:
-# an operator-set value is never overwritten, and 2g/5g is assigned by radio
-# order, matching the factory default and the handler's own fallback.
+# Also removes phantom non-broadcom wifi-device sections (the stock mac80211
+# radio that `wifi config' recreates from board.json on every boot), since this
+# board has no mac80211 radio once the wl driver owns the hardware.
+#
+# On the broadcom sections it only touches those that have neither band nor
+# hwmode: an operator-set value is never overwritten, and 2g/5g is assigned by
+# radio order, matching the factory default and the handler's own fallback.
 
 bcw_radio_config_repair() {
 	command -v uci >/dev/null 2>&1 || return 0
 	_changed=0
+
+	# Drop phantom wifi-devices. /etc/init.d/boot (S10) runs `wifi config',
+	# which turns the stock /etc/board.json `wlan' entry -- the bcma 2.4GHz
+	# radio the stock image describes as mac80211 -- into a `wifi-device' of
+	# type mac80211. That happens before our S19 `handler-single' removes
+	# mac80211.sh, so netifd (S20) ends up with a radio section no handler
+	# claims: ignored at runtime, but it clutters UCI and LuCI's config view,
+	# and reappears on every boot. We own the only radios on this board, so
+	# any wifi-device that is not ours is a phantom; remove it and every
+	# wifi-iface bound to it. Runs before netifd reads the config.
+	for _sec in $(uci -q show wireless 2>/dev/null | \
+		sed -n 's/^wireless\.\([^.]*\)=wifi-device$/\1/p'); do
+		[ "$(uci -q get "wireless.$_sec.type")" = broadcom ] && continue
+		for _if in $(uci -q show wireless 2>/dev/null | \
+			sed -n 's/^wireless\.\([^.]*\)=wifi-iface$/\1/p'); do
+			[ "$(uci -q get "wireless.$_if.device")" = "$_sec" ] || continue
+			uci -q delete "wireless.$_if"
+			_changed=1
+		done
+		uci -q delete "wireless.$_sec"
+		_changed=1
+		logger -t broadcom-wl "wireless.$_sec: removed phantom non-broadcom radio"
+	done
+
 	_idx=-1
 	for _sec in $(uci -q show wireless 2>/dev/null | \
 		sed -n 's/^wireless\.\([^.]*\)=wifi-device$/\1/p'); do
