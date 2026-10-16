@@ -156,6 +156,21 @@ bcw_apply_htmode() {
 	bcw_nvset "wl${_unit}_bw_cap" "$_bwcap"
 	bcw_nvset "wl${_unit}_nbw_cap" "$_bwcap"
 	[ -n "$_ctrlsb" ] && bcw_nvset "wl${_unit}_nctrlsb" "$_ctrlsb"
+
+	# wlconf's channel+bw_cap+nctrlsb path derives the 80MHz centre channel as
+	# "configured + 6", i.e. it only works when the configured channel is the
+	# *block start* (149 -> centre 155). Any other control channel in the block
+	# (e.g. 157) then lands on a non-existent centre (163), the driver rejects
+	# the chanspec, and the radio silently stays at its 20MHz default. So spell
+	# the chanspec out for 80MHz and let wf_chspec_aton() pick the correct
+	# centre and control sideband; wlconf takes an explicit wl<N>_chanspec
+	# verbatim (wlconf.c ~2364). Clear it for every other width so a later
+	# 40/20MHz apply is not pinned to a stale 80MHz chanspec.
+	if [ "$_width" = 80 ]; then
+		bcw_nvset "wl${_unit}_chanspec" "${_channel}/80"
+	else
+		rm -f "$NVRAM_DIR/wl${_unit}_chanspec" "$NVRAM_OVERRIDE_DIR/wl${_unit}_chanspec"
+	fi
 }
 
 # First legal channel for the band, as reported by the driver. Used to turn UCI
