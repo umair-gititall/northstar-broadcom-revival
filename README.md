@@ -329,7 +329,7 @@ kernel's own hotplug driver.
 
 ## Installation
 
-This repository does **not** ship packages in upstream OpenWrt feeds. Build the APKs from source , then install them locally on your router.
+This repository does **not** ship packages in upstream OpenWrt feeds. Build the APKs from source, then install them locally on your router.
 
 **Installing built APKs:**
 
